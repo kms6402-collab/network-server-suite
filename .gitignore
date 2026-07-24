@@ -1,0 +1,13 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Runtime state and packaged output — not source, shouldn't live in git history
+applet_state.json
+served_folder/
+*.exe
