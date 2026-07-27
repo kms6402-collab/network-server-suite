@@ -30,8 +30,16 @@ const scriptDirname = typeof __dirname !== "undefined" ? __dirname : path.dirnam
 const app = express();
 app.use(express.json());
 
-const STATE_FILE = path.join(process.cwd(), "applet_state.json");
-const SERVED_FOLDER = path.join(process.cwd(), "served_folder");
+// A pkg-packaged exe can be launched with process.cwd() pointing anywhere
+// (double-click, shortcut with a different "start in" folder, etc.), which
+// made applet_state.json/served_folder land in a different place on every
+// launch and look like settings kept resetting. Always resolve them next to
+// the actual executable file instead. In dev (tsx), process.cwd() is always
+// the project root (npm run dev), so no change is needed there.
+const isPackagedForPaths = !!(process as any).pkg;
+const appBaseDir = isPackagedForPaths ? path.dirname(process.execPath) : process.cwd();
+const STATE_FILE = path.join(appBaseDir, "applet_state.json");
+const SERVED_FOLDER = path.join(appBaseDir, "served_folder");
 
 // Create served folder if it doesn't exist (clean, no dummy seed files)
 if (!fs.existsSync(SERVED_FOLDER)) {
@@ -181,11 +189,30 @@ loadState();
 function ensureDhcpConfigMatchesHost(): boolean {
   let healInterfaceName = dhcpConfig.interfaceName;
   let healHostInfo = getInterfaceInfo(healInterfaceName);
+  const fellBackToDefaultInterface = !healHostInfo;
   if (!healHostInfo) {
     healInterfaceName = getDefaultInterfaceName();
     healHostInfo = healInterfaceName ? getInterfaceInfo(healInterfaceName) : null;
   }
-  if (healHostInfo && dhcpConfig.gateway !== healHostInfo.ip) {
+  if (!healHostInfo) return false;
+
+  // The adapter can be legitimately stuck in APIPA (169.254.x.x) while the admin
+  // has already saved a real gateway in the DHCP Pool config — that's exactly the
+  // transient state /api/dhcp/toggle's netsh auto-fix step is meant to resolve, by
+  // pushing dhcpConfig.gateway onto the adapter. If we self-heal here first, we'd
+  // silently overwrite the admin's saved config with the adapter's throwaway APIPA
+  // address before netsh ever gets a chance to run, turning a normal "adapter
+  // hasn't been assigned yet" moment into permanent data loss. So: only self-heal
+  // on an APIPA host if we also had to fall back to a different adapter entirely
+  // (i.e. the persisted interfaceName is stale/from another host) — a saved,
+  // still-valid non-APIPA gateway for the *same* adapter is left alone.
+  const hostIsApipa = healHostInfo.ip.startsWith("169.254.");
+  const configGatewayIsValid = isValidIPv4(dhcpConfig.gateway) && !dhcpConfig.gateway.startsWith("169.254.");
+  if (hostIsApipa && configGatewayIsValid && !fellBackToDefaultInterface) {
+    return false;
+  }
+
+  if (dhcpConfig.gateway !== healHostInfo.ip) {
     dhcpConfig = {
       ...dhcpConfig,
       interfaceName: healInterfaceName,
@@ -1020,7 +1047,12 @@ function scanArpTable(): Promise<{ ip: string; mac: string }[]> {
         return;
       }
       const results: { ip: string; mac: string }[] = [];
-      const ipMacRegex = /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})\s+(\w+)/;
+      // The trailing "Type" column (dynamic/static) is never used below, so it's
+      // matched loosely as \S+ rather than \w+ — on a Korean-localized Windows,
+      // `arp -a` prints that column as Hangul (동적/정적), which JS's \w (ASCII-only
+      // without a /u + \p{L} unicode flag) never matches, silently dropping every
+      // line and making this always resolve to an empty table.
+      const ipMacRegex = /^\s*(\d{1,3}(?:\.\d{1,3}){3})\s+([0-9a-fA-F]{2}(?:[-:][0-9a-fA-F]{2}){5})\s+(\S+)/;
       for (const line of stdout.split("\n")) {
         const match = line.match(ipMacRegex);
         if (!match) continue;
@@ -2298,11 +2330,36 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
 // devices (plain PCs/servers) will typically just echo back "command not
 // found"-style output for these commands, which is expected and not treated
 // as a request failure.
+//
+// Accepts either a registered TerminalHost (via `hostId`) or an ad-hoc,
+// one-off set of connection details (`ip`/`port`/`protocol`/`username`/
+// `password`) for a device that isn't registered as a TerminalHost — e.g.
+// a DHCP lease the user wants to query without first adding it as an
+// automation target. The ad-hoc credentials are never persisted to
+// `terminalHosts`; they only live for the duration of this single request.
 app.post("/api/terminal/neighbors", async (req, res) => {
-  const { hostId } = req.body;
-  const host = terminalHosts.find(h => h.id === hostId);
-  if (!host) {
-    return res.status(404).json({ error: "Host not found" });
+  const { hostId, ip, port, protocol, username, password } = req.body;
+
+  let host: TerminalHost | undefined;
+  if (hostId) {
+    host = terminalHosts.find(h => h.id === hostId);
+    if (!host) {
+      return res.status(404).json({ error: "Host not found" });
+    }
+  } else {
+    if (!ip || !username) {
+      return res.status(400).json({ error: "ip와 username이 필요합니다." });
+    }
+    const adhocProtocol: 'SSH' | 'TELNET' = protocol === "TELNET" ? "TELNET" : "SSH";
+    host = {
+      id: "adhoc",
+      name: ip,
+      ip,
+      port: Number(port) || (adhocProtocol === "TELNET" ? 23 : 22),
+      protocol: adhocProtocol,
+      username,
+      password
+    };
   }
 
   const result = await queryNeighborInfo(host);

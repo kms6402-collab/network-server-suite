@@ -1,16 +1,18 @@
 import React, { useState, useEffect } from 'react';
-import { 
+import {
   Server, Network, Plus, Trash2, ShieldAlert,
   HelpCircle, RefreshCw, Layers, Check, Database,
-  Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings
+  Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
+  Radar, X, AlertCircle
 } from 'lucide-react';
-import { DhcpConfig, DhcpLease, DhcpReservation } from '../types';
+import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
 
 interface DhcpServerProps {
   dhcpRunning: boolean;
   config: DhcpConfig;
   leases: DhcpLease[];
   reservations: DhcpReservation[];
+  terminalHosts: TerminalHost[];
   onToggleDhcp: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   onUpdateConfig: (newConfig: DhcpConfig) => Promise<{ success: boolean; error?: string }>;
   onAddReservation: (mac: string, ip: string, hostname: string) => void;
@@ -25,6 +27,7 @@ export default function DhcpServer({
   config,
   leases,
   reservations,
+  terminalHosts,
   onToggleDhcp,
   onUpdateConfig,
   onAddReservation,
@@ -351,6 +354,70 @@ export default function DhcpServer({
       label: '일반 할당 단말 (Generic Client)',
       badgeColor: 'bg-slate-500/15 text-slate-300 border-slate-500/30'
     };
+  };
+
+  // CDP/LLDP neighbor lookup for a lease in the active-lease list. If the
+  // lease's IP matches an already-registered TerminalHost (자동화 접속 대상 장비),
+  // we can query immediately using that host's saved credentials. Otherwise we
+  // need a one-off set of connection details from the user — that's what the
+  // 'form' mode below collects (never persisted, used for this single request
+  // only).
+  const [neighborModal, setNeighborModal] = useState<{ lease: DhcpLease; mode: 'form' | 'loading' | 'result' } | null>(null);
+  const [neighborResult, setNeighborResult] = useState<{ success: boolean; output?: string; error?: string } | null>(null);
+  const [credProtocol, setCredProtocol] = useState<'SSH' | 'TELNET'>('SSH');
+  const [credPort, setCredPort] = useState(22);
+  const [credUsername, setCredUsername] = useState('');
+  const [credPassword, setCredPassword] = useState('');
+
+  const runNeighborQuery = async (payload: Record<string, unknown>) => {
+    setNeighborModal(prev => (prev ? { ...prev, mode: 'loading' } : prev));
+    setNeighborResult(null);
+    try {
+      const res = await fetch('/api/terminal/neighbors', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
+      const data = await res.json();
+      setNeighborResult(data);
+    } catch (err: any) {
+      setNeighborResult({ success: false, error: err?.message || '요청 중 알 수 없는 오류가 발생했습니다.' });
+    } finally {
+      setNeighborModal(prev => (prev ? { ...prev, mode: 'result' } : prev));
+    }
+  };
+
+  const handleOpenNeighborQuery = (lease: DhcpLease) => {
+    const matchedHost = terminalHosts.find(h => h.ip === lease.ip);
+    if (matchedHost) {
+      setNeighborModal({ lease, mode: 'loading' });
+      setNeighborResult(null);
+      runNeighborQuery({ hostId: matchedHost.id });
+    } else {
+      setCredProtocol('SSH');
+      setCredPort(22);
+      setCredUsername('');
+      setCredPassword('');
+      setNeighborResult(null);
+      setNeighborModal({ lease, mode: 'form' });
+    }
+  };
+
+  const handleSubmitAdhocNeighborQuery = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!neighborModal || !credUsername) return;
+    runNeighborQuery({
+      ip: neighborModal.lease.ip,
+      port: credPort,
+      protocol: credProtocol,
+      username: credUsername,
+      password: credPassword || undefined
+    });
+  };
+
+  const closeNeighborModal = () => {
+    setNeighborModal(null);
+    setNeighborResult(null);
   };
 
   // Filtered leases based on search term
@@ -763,6 +830,16 @@ export default function DhcpServer({
                         </span>
                         {lease.id !== 'host-pc-self' && (
                           <button
+                            id={`neighbors-lease-${lease.id}`}
+                            onClick={() => handleOpenNeighborQuery(lease)}
+                            className="text-slate-400 hover:text-sky-400 p-0.5 rounded transition cursor-pointer"
+                            title="CDP/LLDP 이웃 정보 조회"
+                          >
+                            <Radar className="w-3 h-3" />
+                          </button>
+                        )}
+                        {lease.id !== 'host-pc-self' && (
+                          <button
                             id={`remove-lease-${lease.id}`}
                             onClick={() => onRemoveLease(lease.id)}
                             className="text-slate-400 hover:text-rose-400 p-0.5 rounded transition cursor-pointer"
@@ -856,6 +933,16 @@ export default function DhcpServer({
                           </span>
                         </td>
                         <td className="p-2 text-right pr-3">
+                          {lease.id !== 'host-pc-self' && (
+                            <button
+                              id={`neighbors-lease-table-${lease.id}`}
+                              onClick={() => handleOpenNeighborQuery(lease)}
+                              className="text-slate-400 hover:text-sky-400 p-1 rounded transition cursor-pointer"
+                              title="CDP/LLDP 이웃 정보 조회"
+                            >
+                              <Radar className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           {lease.id !== 'host-pc-self' && (
                             <button
                               id={`remove-lease-table-${lease.id}`}
@@ -1041,6 +1128,140 @@ export default function DhcpServer({
           </div>
         </div>
       </div>
+
+      {/* CDP/LLDP neighbor lookup modal — triggered from the active-lease list
+          above. If the lease's IP matched a registered TerminalHost, the
+          query has already started (mode 'loading') using that host's saved
+          credentials. Otherwise the user is first asked for one-off
+          connection details (mode 'form') that are never persisted, only
+          used for this single request. */}
+      {neighborModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={closeNeighborModal}
+        >
+          <div
+            className="bg-slate-950 border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between border-b border-slate-850 px-5 py-3 shrink-0">
+              <div>
+                <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
+                  <Radar className="w-4 h-4 text-sky-400" />
+                  CDP/LLDP 이웃 정보 — {neighborModal.lease.hostname || neighborModal.lease.ip}
+                </h3>
+                {neighborModal.mode === 'result' && (
+                  <p className="text-[10px] text-slate-500 mt-0.5">
+                    일반 PC/서버 등 비-네트워크 장비는 "지원하지 않는 명령입니다" 류의 출력이 그대로 나올 수 있으며, 이는 정상입니다.
+                  </p>
+                )}
+                {neighborModal.mode === 'form' && (
+                  <p className="text-[10px] text-slate-500 mt-0.5">
+                    이 단말({neighborModal.lease.ip})은 등록된 SSH/Telnet 장비 목록에 없어 접속 계정 정보가 필요합니다. 입력한 정보는 저장되지 않고 이번 조회 1회에만 사용됩니다.
+                  </p>
+                )}
+              </div>
+              <button
+                id="close-lease-neighbor-modal-btn"
+                onClick={closeNeighborModal}
+                className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 cursor-pointer transition shrink-0"
+                title="닫기"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="flex-1 overflow-y-auto p-5">
+              {neighborModal.mode === 'form' && (
+                <form onSubmit={handleSubmitAdhocNeighborQuery} className="space-y-3 text-xs" id="adhoc-neighbor-cred-form">
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-slate-300 font-bold mb-1">프로토콜</label>
+                      <select
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
+                        value={credProtocol}
+                        onChange={(e) => {
+                          const p = e.target.value as 'SSH' | 'TELNET';
+                          setCredProtocol(p);
+                          setCredPort(p === 'SSH' ? 22 : 23);
+                        }}
+                      >
+                        <option value="SSH">SSH</option>
+                        <option value="TELNET">TELNET</option>
+                      </select>
+                    </div>
+                    <div className="col-span-2">
+                      <label className="block text-slate-300 font-bold mb-1">접속 포트</label>
+                      <input
+                        type="number"
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white font-mono focus:outline-none"
+                        value={credPort}
+                        onChange={(e) => setCredPort(Number(e.target.value))}
+                        required
+                      />
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-slate-300 font-bold mb-1">사용자 계정 (User)</label>
+                      <input
+                        type="text"
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
+                        placeholder="admin"
+                        value={credUsername}
+                        onChange={(e) => setCredUsername(e.target.value)}
+                        required
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-300 font-bold mb-1">비밀번호 (Secret)</label>
+                      <input
+                        type="password"
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
+                        placeholder="••••••••"
+                        value={credPassword}
+                        onChange={(e) => setCredPassword(e.target.value)}
+                      />
+                    </div>
+                  </div>
+                  <div className="flex justify-end gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={closeNeighborModal}
+                      className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg cursor-pointer transition"
+                    >
+                      취소
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={!credUsername}
+                      className="px-3 py-1.5 bg-sky-600 hover:bg-sky-500 disabled:opacity-30 disabled:pointer-events-none text-white rounded-lg font-bold cursor-pointer transition"
+                    >
+                      조회 실행
+                    </button>
+                  </div>
+                </form>
+              )}
+              {neighborModal.mode === 'loading' && (
+                <div className="flex flex-col items-center justify-center gap-3 text-slate-400 text-xs py-12">
+                  <RefreshCw className="w-6 h-6 animate-spin text-sky-400" />
+                  <p>장비에 접속하여 CDP/LLDP 정보를 수집 중입니다... (약 5초 소요될 수 있습니다)</p>
+                </div>
+              )}
+              {neighborModal.mode === 'result' && neighborResult && neighborResult.success && (
+                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] text-emerald-300/90 leading-relaxed">
+                  {neighborResult.output || '(응답 없음 — 장비가 CDP/LLDP 명령을 지원하지 않거나 이웃 장비가 없을 수 있습니다.)'}
+                </pre>
+              )}
+              {neighborModal.mode === 'result' && neighborResult && !neighborResult.success && (
+                <div className="flex items-start gap-2 text-rose-400 text-xs bg-rose-950/20 border border-rose-900/40 rounded-xl p-3">
+                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                  <span>{neighborResult.error || '알 수 없는 오류가 발생했습니다.'}</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

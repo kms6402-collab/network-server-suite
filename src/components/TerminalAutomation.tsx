@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Terminal, ShieldCheck, Plus, Trash2, Play, Pencil,
   Send, Server, AlertCircle, RefreshCw, Download, Plug, Unplug, Radio,
-  Wifi, CheckSquare, Square, PencilLine, X, XCircle, Radar
+  Wifi, CheckSquare, Square, PencilLine, X, XCircle
 } from 'lucide-react';
 import { TerminalHost, CommandScript, ScriptExecution, DhcpLease } from '../types';
 
@@ -100,11 +100,6 @@ export default function TerminalAutomation({
   // update/delete) has entries, this toggle lets the batch runner target all
   // of them at once instead of the single-host dropdown below.
   const [runOnAllSelectedHosts, setRunOnAllSelectedHosts] = useState(false);
-
-  // CDP/LLDP neighbor lookup modal state.
-  const [neighborModalHostId, setNeighborModalHostId] = useState<string | null>(null);
-  const [neighborLoading, setNeighborLoading] = useState(false);
-  const [neighborResult, setNeighborResult] = useState<{ success: boolean; output?: string; error?: string } | null>(null);
 
   // Manual terminal input
   const [manualCommand, setManualCommand] = useState("");
@@ -374,31 +369,6 @@ export default function TerminalAutomation({
     }
     if (!selectedHostId) return;
     onExecuteScript(selectedHostId, selectedScriptId);
-  };
-
-  const handleQueryNeighbors = async (hostId: string) => {
-    setNeighborModalHostId(hostId);
-    setNeighborLoading(true);
-    setNeighborResult(null);
-    try {
-      const res = await fetch('/api/terminal/neighbors', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hostId })
-      });
-      const data = await res.json();
-      setNeighborResult(data);
-    } catch (err: any) {
-      setNeighborResult({ success: false, error: err?.message || '요청 중 알 수 없는 오류가 발생했습니다.' });
-    } finally {
-      setNeighborLoading(false);
-    }
-  };
-
-  const closeNeighborModal = () => {
-    setNeighborModalHostId(null);
-    setNeighborResult(null);
-    setNeighborLoading(false);
   };
 
   const handleSendManualCommand = (e: React.FormEvent) => {
@@ -852,14 +822,6 @@ export default function TerminalAutomation({
                       <Plug className="w-3.5 h-3.5" />
                     </button>
                     <button
-                      id={`neighbors-host-${host.id}`}
-                      onClick={() => handleQueryNeighbors(host.id)}
-                      className="p-1.5 text-slate-400 hover:text-sky-400 rounded-lg hover:bg-sky-950/20 cursor-pointer transition"
-                      title="CDP/LLDP 이웃 정보 조회"
-                    >
-                      <Radar className="w-3.5 h-3.5" />
-                    </button>
-                    <button
                       id={`edit-host-${host.id}`}
                       onClick={() => handleEditHostClick(host)}
                       className="p-1.5 text-slate-400 hover:text-indigo-400 rounded-lg hover:bg-indigo-950/20 cursor-pointer transition"
@@ -1263,62 +1225,6 @@ export default function TerminalAutomation({
         )}
       </div>
 
-      {/* CDP/LLDP neighbor lookup modal: opens a brand-new, temporary
-          SSH/Telnet connection on the backend (separate from any live
-          session), runs "show cdp/lldp neighbors detail", and shows the raw
-          output here. Non-network devices (plain PCs/servers) commonly
-          return "command not found"-style output for these commands, which
-          is expected and not treated as an error. */}
-      {neighborModalHostId && (
-        <div
-          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
-          onClick={closeNeighborModal}
-        >
-          <div
-            className="bg-slate-950 border border-slate-800 rounded-2xl w-full max-w-2xl max-h-[80vh] flex flex-col shadow-2xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between border-b border-slate-850 px-5 py-3 shrink-0">
-              <div>
-                <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
-                  <Radar className="w-4 h-4 text-sky-400" />
-                  CDP/LLDP 이웃 정보 — {getHostNameFromId(neighborModalHostId)}
-                </h3>
-                <p className="text-[10px] text-slate-500 mt-0.5">
-                  일반 PC/서버 등 비-네트워크 장비는 "지원하지 않는 명령입니다" 류의 출력이 그대로 나올 수 있으며, 이는 정상입니다.
-                </p>
-              </div>
-              <button
-                id="close-neighbor-modal-btn"
-                onClick={closeNeighborModal}
-                className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 cursor-pointer transition shrink-0"
-                title="닫기"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <div className="flex-1 overflow-y-auto p-5">
-              {neighborLoading && (
-                <div className="flex flex-col items-center justify-center gap-3 text-slate-400 text-xs py-12">
-                  <RefreshCw className="w-6 h-6 animate-spin text-sky-400" />
-                  <p>장비에 접속하여 CDP/LLDP 정보를 수집 중입니다... (약 5초 소요될 수 있습니다)</p>
-                </div>
-              )}
-              {!neighborLoading && neighborResult && neighborResult.success && (
-                <pre className="whitespace-pre-wrap break-all font-mono text-[11px] text-emerald-300/90 leading-relaxed">
-                  {neighborResult.output || '(응답 없음 — 장비가 CDP/LLDP 명령을 지원하지 않거나 이웃 장비가 없을 수 있습니다.)'}
-                </pre>
-              )}
-              {!neighborLoading && neighborResult && !neighborResult.success && (
-                <div className="flex items-start gap-2 text-rose-400 text-xs bg-rose-950/20 border border-rose-900/40 rounded-xl p-3">
-                  <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
-                  <span>{neighborResult.error || '알 수 없는 오류가 발생했습니다.'}</span>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 }
