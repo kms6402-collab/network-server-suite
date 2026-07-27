@@ -3,7 +3,7 @@ import {
   Server, Network, Plus, Trash2, ShieldAlert,
   HelpCircle, RefreshCw, Layers, Check, Database,
   Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
-  Radar, X, AlertCircle
+  Radar, X, AlertCircle, Download
 } from 'lucide-react';
 import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
 
@@ -19,6 +19,7 @@ interface DhcpServerProps {
   onRemoveReservation: (id: string) => void;
   onClearLeases: () => void;
   onRemoveLease: (id: string) => void;
+  onRenewLease: (id: string) => void;
   onRefreshDiscovery: () => void;
 }
 
@@ -34,6 +35,7 @@ export default function DhcpServer({
   onRemoveReservation,
   onClearLeases,
   onRemoveLease,
+  onRenewLease,
   onRefreshDiscovery
 }: DhcpServerProps) {
   // Feedback banner for "설정 적용" (save config) and service toggle actions —
@@ -430,6 +432,50 @@ export default function DhcpServer({
     );
   });
 
+  // Standard CSV field escaping: wrap every value in double quotes, and
+  // double-up any double quotes already inside the value.
+  const csvField = (value: string) => `"${value.replace(/"/g, '""')}"`;
+
+  // Export the currently-visible (search-filtered) lease list as a CSV file.
+  // Client-side only, same Blob + URL.createObjectURL download pattern used
+  // by TerminalAutomation's log export, but built fresh here for CSV rows.
+  const handleExportLeases = () => {
+    const onlineLabelFor = (lease: DhcpLease) => {
+      if (lease.online === undefined) return '확인중';
+      return lease.online ? '온라인' : '오프라인';
+    };
+
+    const header = ['호스트명', 'IP주소', 'MAC주소', '인터페이스', '임대시작', '만료시간', '상태', '온라인여부'];
+    const rows = filteredLeases.map(lease => [
+      lease.hostname,
+      lease.ip,
+      lease.mac,
+      lease.interfaceName,
+      new Date(lease.leasedAt).toLocaleString(),
+      new Date(lease.expiresAt).toLocaleString(),
+      lease.status === 'reserved' ? '고정예약' : '대여중',
+      onlineLabelFor(lease)
+    ]);
+
+    const csvContent = [header, ...rows]
+      .map(row => row.map(cell => csvField(String(cell))).join(','))
+      .join('\r\n');
+
+    // UTF-8 BOM so Excel doesn't mangle Korean text.
+    const blob = new Blob(['﻿' + csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    const now = new Date();
+    const timestamp = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dhcp-leases-${timestamp}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   return (
     <div className="space-y-6 animate-fade-in" id="dhcp-tab">
       {/* Feedback banner for save-config / service-toggle actions */}
@@ -771,8 +817,18 @@ export default function DhcpServer({
                 </button>
               </div>
 
+              {/* Export current (filtered) leases as CSV */}
+              <button
+                id="export-leases-btn"
+                onClick={handleExportLeases}
+                className="text-slate-400 hover:text-emerald-400 border border-slate-850 bg-slate-950 p-1.5 rounded-lg text-xs cursor-pointer transition"
+                title="현재 목록을 CSV 파일로 내보내기"
+              >
+                <Download className="w-3 h-3" />
+              </button>
+
               {/* Flush leases */}
-              <button 
+              <button
                 id="clear-leases-btn"
                 onClick={onClearLeases}
                 className="text-slate-400 hover:text-rose-400 border border-slate-850 bg-slate-950 p-1.5 rounded-lg text-xs cursor-pointer transition"
@@ -836,6 +892,16 @@ export default function DhcpServer({
                             title="CDP/LLDP 이웃 정보 조회"
                           >
                             <Radar className="w-3 h-3" />
+                          </button>
+                        )}
+                        {lease.id !== 'host-pc-self' && (
+                          <button
+                            id={`renew-lease-${lease.id}`}
+                            onClick={() => onRenewLease(lease.id)}
+                            className="text-slate-400 hover:text-indigo-400 p-0.5 rounded transition cursor-pointer"
+                            title="이 단말의 DHCP 임대 갱신"
+                          >
+                            <RefreshCw className="w-3 h-3" />
                           </button>
                         )}
                         {lease.id !== 'host-pc-self' && (
@@ -941,6 +1007,16 @@ export default function DhcpServer({
                               title="CDP/LLDP 이웃 정보 조회"
                             >
                               <Radar className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {lease.id !== 'host-pc-self' && (
+                            <button
+                              id={`renew-lease-table-${lease.id}`}
+                              onClick={() => onRenewLease(lease.id)}
+                              className="text-slate-400 hover:text-indigo-400 p-1 rounded transition cursor-pointer"
+                              title="이 단말의 DHCP 임대 갱신"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
                             </button>
                           )}
                           {lease.id !== 'host-pc-self' && (

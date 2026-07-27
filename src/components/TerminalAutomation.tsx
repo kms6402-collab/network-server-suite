@@ -2,15 +2,18 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Terminal, ShieldCheck, Plus, Trash2, Play, Pencil,
   Send, Server, AlertCircle, RefreshCw, Download, Plug, Unplug, Radio,
-  Wifi, CheckSquare, Square, PencilLine, X, XCircle
+  Wifi, CheckSquare, Square, PencilLine, X, XCircle, Save, Bookmark
 } from 'lucide-react';
-import { TerminalHost, CommandScript, ScriptExecution, DhcpLease } from '../types';
+import { TerminalHost, CommandScript, ScriptExecution, DhcpLease, BatchJob } from '../types';
 
 interface TerminalAutomationProps {
   hosts: TerminalHost[];
   scripts: CommandScript[];
   executions: ScriptExecution[];
   leases: DhcpLease[];
+  batchJobs: BatchJob[];
+  onSaveBatchJob: (name: string, hostIds: string[], scriptId: string) => void;
+  onDeleteBatchJob: (id: string) => void;
   onAddHost: (name: string, ip: string, port: number, protocol: 'SSH' | 'TELNET', username: string, password?: string) => void;
   onUpdateHost: (id: string, name: string, ip: string, port: number, protocol: 'SSH' | 'TELNET', username: string, password?: string) => void;
   onRemoveHost: (id: string) => void;
@@ -34,6 +37,9 @@ export default function TerminalAutomation({
   scripts,
   executions,
   leases,
+  batchJobs,
+  onSaveBatchJob,
+  onDeleteBatchJob,
   onAddHost,
   onUpdateHost,
   onRemoveHost,
@@ -100,6 +106,15 @@ export default function TerminalAutomation({
   // update/delete) has entries, this toggle lets the batch runner target all
   // of them at once instead of the single-host dropdown below.
   const [runOnAllSelectedHosts, setRunOnAllSelectedHosts] = useState(false);
+
+  // Naming a new Batch Job: an in-app modal instead of window.prompt(), which
+  // blocks the whole page's JS thread on a native browser dialog (froze the
+  // app during testing) and can't be styled to match the rest of the UI.
+  const [showBatchNameModal, setShowBatchNameModal] = useState(false);
+  const [batchNameInput, setBatchNameInput] = useState("");
+  // Non-blocking replacement for alert() when a saved batch job can no longer
+  // run (its script/hosts were deleted since it was saved).
+  const [batchJobError, setBatchJobError] = useState<string | null>(null);
 
   // Manual terminal input
   const [manualCommand, setManualCommand] = useState("");
@@ -369,6 +384,43 @@ export default function TerminalAutomation({
     }
     if (!selectedHostId) return;
     onExecuteScript(selectedHostId, selectedScriptId);
+  };
+
+  // Persist the currently-selected "device list + script" combo (batchModeActive
+  // state) as a named Batch Job that can be one-click re-run later without
+  // reselecting checkboxes every time. Opens the in-app naming modal below
+  // instead of blocking on window.prompt().
+  const handleSaveCurrentAsBatchJob = () => {
+    if (selectedHostIds.size === 0 || !selectedScriptId) return;
+    setBatchNameInput("");
+    setShowBatchNameModal(true);
+  };
+
+  const handleConfirmSaveBatchJob = (e: React.FormEvent) => {
+    e.preventDefault();
+    const name = batchNameInput.trim();
+    if (!name) return;
+    onSaveBatchJob(name, Array.from(selectedHostIds), selectedScriptId);
+    setShowBatchNameModal(false);
+  };
+
+  // Re-run a saved batch job: filter out hosts/scripts that may have been
+  // removed since the job was saved, then fan out onExecuteScript calls the
+  // same staggered way handleRunScript does for the live multi-select.
+  const handleRunSavedBatchJob = (job: BatchJob) => {
+    if (!scripts.some(s => s.id === job.scriptId)) {
+      setBatchJobError(`"${job.name}" 배치 작업이 참조하는 스크립트가 더 이상 존재하지 않습니다.`);
+      return;
+    }
+    const targetHostIds = job.hostIds.filter(id => hosts.some(h => h.id === id));
+    if (targetHostIds.length === 0) {
+      setBatchJobError(`"${job.name}" 배치 작업에 포함된 장비가 더 이상 존재하지 않습니다.`);
+      return;
+    }
+    setBatchJobError(null);
+    targetHostIds.forEach((hostId, idx) => {
+      setTimeout(() => onExecuteScript(hostId, job.scriptId), idx * 200);
+    });
   };
 
   const handleSendManualCommand = (e: React.FormEvent) => {
@@ -1026,13 +1078,76 @@ export default function TerminalAutomation({
               ? `선택된 ${selectedHostIds.size}개 장비에 일괄 배치 실행 (RUN BATCH)`
               : '배치 자동화 CLI 배포 실행 (RUN BATCH)'}
           </button>
+
+          {selectedHostIds.size > 0 && selectedScriptId && (
+            <button
+              id="save-batch-job-btn"
+              onClick={handleSaveCurrentAsBatchJob}
+              className="w-full py-2 bg-slate-850 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-xl font-bold tracking-wider text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition duration-150"
+            >
+              <Save className="w-3.5 h-3.5 text-indigo-300" />
+              이 조합을 배치 작업으로 저장 ({selectedHostIds.size}개 장비)
+            </button>
+          )}
         </div>
+      </div>
+
+      {/* Saved Batch Jobs: named "device list + script" combos for one-click re-runs */}
+      <div className="p-5 glass-card rounded-2xl space-y-3">
+        <h3 className="text-sm font-display font-bold text-white border-b border-slate-855 pb-2.5 flex items-center gap-1.5">
+          <Bookmark className="w-4 h-4 text-indigo-400" />
+          저장된 배치 작업 (Saved Batch Jobs)
+        </h3>
+        {batchJobError && (
+          <div className="p-2.5 rounded-lg border border-rose-900/50 bg-rose-950/30 text-rose-300 text-xs flex items-center justify-between gap-2">
+            <span>{batchJobError}</span>
+            <button type="button" onClick={() => setBatchJobError(null)} className="text-slate-400 hover:text-white cursor-pointer shrink-0">×</button>
+          </div>
+        )}
+        {batchJobs.length === 0 ? (
+          <div className="text-slate-500 text-center py-8 text-xs font-medium">저장된 배치 작업이 없습니다.</div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {batchJobs.map(job => {
+              const jobScript = scripts.find(s => s.id === job.scriptId);
+              return (
+                <div key={job.id} className="p-3.5 bg-slate-950/40 border border-slate-850 rounded-xl space-y-2.5 hover:border-slate-700/80 transition">
+                  <div>
+                    <div className="text-sm font-bold text-white truncate">{job.name}</div>
+                    <div className="text-[11px] text-slate-400 mt-1 space-y-0.5">
+                      <div>대상 장비: {job.hostIds.length}개</div>
+                      <div className="truncate">스크립트: {jobScript ? jobScript.name : '(삭제된 스크립트)'}</div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => handleRunSavedBatchJob(job)}
+                      className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 cursor-pointer transition"
+                    >
+                      <Play className="w-3 h-3" />
+                      실행
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (window.confirm(`배치 작업 "${job.name}"을(를) 삭제하시겠습니까?`)) onDeleteBatchJob(job.id);
+                      }}
+                      className="p-1.5 text-slate-400 hover:text-rose-400 rounded-lg hover:bg-rose-950/20 cursor-pointer transition"
+                      title="배치 작업 삭제"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Interactive Concurrent Terminal Sessions */}
       <div className="p-5 glass-card rounded-2xl space-y-4">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-855 pb-3">
-          <div>
+          <div className="shrink-0 max-w-full sm:max-w-[45%]">
             <h3 className="text-sm font-display font-bold text-white">
               실시간 원격 CLI 세션 뷰어 (SecureCRT Interactive Terminal Emulator)
             </h3>
@@ -1040,7 +1155,7 @@ export default function TerminalAutomation({
           </div>
 
           {/* Active session tabs selection */}
-          <div className="flex items-center gap-1.5">
+          <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <div className="flex gap-1.5 overflow-x-auto max-w-full pb-1">
               {executions.map((exec, idx) => (
                 <button
@@ -1225,6 +1340,51 @@ export default function TerminalAutomation({
         )}
       </div>
 
+      {showBatchNameModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4"
+          onClick={() => setShowBatchNameModal(false)}
+        >
+          <div
+            className="bg-slate-950 border border-slate-800 rounded-2xl w-full max-w-sm shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <form onSubmit={handleConfirmSaveBatchJob} className="p-5 space-y-3">
+              <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
+                <Save className="w-4 h-4 text-indigo-400" />
+                배치 작업으로 저장
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                선택된 {selectedHostIds.size}개 장비 + 스크립트 조합에 이름을 붙여 저장합니다. 다음부터는 이 이름으로 한 번에 다시 실행할 수 있습니다.
+              </p>
+              <input
+                type="text"
+                autoFocus
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-white text-sm focus:outline-none focus:border-indigo-500"
+                placeholder="예: 지사 스위치 일괄 재부팅"
+                value={batchNameInput}
+                onChange={(e) => setBatchNameInput(e.target.value)}
+              />
+              <div className="flex justify-end gap-2 text-xs pt-1">
+                <button
+                  type="button"
+                  onClick={() => setShowBatchNameModal(false)}
+                  className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg cursor-pointer transition"
+                >
+                  취소
+                </button>
+                <button
+                  type="submit"
+                  disabled={!batchNameInput.trim()}
+                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-30 disabled:pointer-events-none text-white rounded-lg font-bold cursor-pointer transition"
+                >
+                  저장
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

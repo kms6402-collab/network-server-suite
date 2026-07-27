@@ -75,6 +75,17 @@ export interface CommandScript {
   commands: string[];
 }
 
+// A saved "device list + script" combination that can be re-run as a single
+// batch (see TerminalAutomation.tsx "저장된 배치 작업" panel). Purely a
+// frontend convenience over the existing per-host POST /api/scripts/execute
+// fan-out — no dedicated execution logic lives on the backend for this.
+export interface BatchJob {
+  id: string;
+  name: string;
+  hostIds: string[];
+  scriptId: string;
+}
+
 export interface ScriptExecution {
   id: string;
   hostId: string;

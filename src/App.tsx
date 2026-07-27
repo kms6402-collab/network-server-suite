@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import { 
   SystemStatus, DhcpConfig, DhcpLease, DhcpReservation, 
-  TftpFtpConfig, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution 
+  TftpFtpConfig, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution, BatchJob
 } from './types';
 
 // Import sub-components
@@ -57,6 +57,7 @@ export default function App() {
   const [commandScripts, setCommandScripts] = useState<CommandScript[]>([]);
   const [dhcpConsoleLogs, setDhcpConsoleLogs] = useState<{ timestamp: string; level: 'INFO' | 'SUCCESS' | 'WARN'; message: string }[]>([]);
   const [scriptExecutions, setScriptExecutions] = useState<ScriptExecution[]>([]);
+  const [batchJobs, setBatchJobs] = useState<BatchJob[]>([]);
 
   // Function to load all backend state together
   const fetchAllState = async () => {
@@ -73,6 +74,7 @@ export default function App() {
       setTransferLogs(data.transferLogs);
       setTerminalHosts(data.terminalHosts);
       setCommandScripts(data.commandScripts);
+      setBatchJobs(data.batchJobs);
       setDhcpConsoleLogs(data.dhcpConsoleLogs);
       
       // Also fetch scripts executions
@@ -225,6 +227,21 @@ export default function App() {
   const handleRemoveLease = async (id: string) => {
     try {
       const res = await fetch(`/api/dhcp/leases/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        const data = await res.json();
+        setLeases(data.leases);
+        setDhcpConsoleLogs(data.dhcpConsoleLogs);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Manually "renew" a single lease — asks the backend to push out its
+  // expiry, retry reverse DNS, and re-ping the IP in one admin action.
+  const handleRenewLease = async (id: string) => {
+    try {
+      const res = await fetch(`/api/dhcp/leases/${id}/renew`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setLeases(data.leases);
@@ -593,6 +610,33 @@ export default function App() {
     }
   };
 
+  // Saved batch jobs ("device list + script" combo re-run) — pure CRUD
+  // against the new /api/batch-jobs endpoints; actual execution is handled
+  // entirely inside TerminalAutomation by replaying onExecuteScript per host.
+  const handleSaveBatchJob = async (name: string, hostIds: string[], scriptId: string) => {
+    try {
+      const res = await fetch('/api/batch-jobs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name, hostIds, scriptId })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setBatchJobs(data.batchJobs);
+      }
+    } catch (e) { console.error(e); }
+  };
+
+  const handleDeleteBatchJob = async (id: string) => {
+    try {
+      const res = await fetch(`/api/batch-jobs/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        const data = await res.json();
+        setBatchJobs(data.batchJobs);
+      }
+    } catch (e) { console.error(e); }
+  };
+
   // Settings & Recovery
   const handleToggleAutoStart = async (enabled: boolean) => {
     try {
@@ -658,7 +702,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.0.1 Enterprise
+                v2.1.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">통합 DHCP, TFTP, FTP 데몬 관리 및 CRT 자동화 텔넷/SSH 콘솔</p>
@@ -759,6 +803,7 @@ export default function App() {
                 onRemoveReservation={handleRemoveReservation}
                 onClearLeases={handleClearLeases}
                 onRemoveLease={handleRemoveLease}
+                onRenewLease={handleRenewLease}
                 onRefreshDiscovery={handleRefreshDiscovery}
               />
             )}
@@ -784,6 +829,9 @@ export default function App() {
                 scripts={commandScripts}
                 executions={scriptExecutions}
                 leases={leases}
+                batchJobs={batchJobs}
+                onSaveBatchJob={handleSaveBatchJob}
+                onDeleteBatchJob={handleDeleteBatchJob}
                 onAddHost={handleAddHost}
                 onUpdateHost={handleUpdateHost}
                 onRemoveHost={handleRemoveHost}

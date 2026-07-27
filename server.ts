@@ -16,9 +16,10 @@ import {
   TftpFtpConfig, 
   TransferLog, 
   TerminalHost, 
-  CommandScript, 
+  CommandScript,
   ScriptExecution,
-  SystemStatus
+  SystemStatus,
+  BatchJob
 } from "./src/types.js";
 
 // esbuild bundles this file to CJS for pkg, where import.meta.url is empty
@@ -115,6 +116,11 @@ let transferLogs: TransferLog[] = [];
 let terminalHosts: TerminalHost[] = [];
 let commandScripts: CommandScript[] = [];
 let scriptExecutions: ScriptExecution[] = [];
+// Saved "device list + script" combinations for one-click batch re-runs
+// (see POST /api/batch-jobs / DELETE /api/batch-jobs/:id below). Execution
+// itself has no backend representation — the frontend just replays the
+// existing per-host /api/scripts/execute fan-out.
+let batchJobs: BatchJob[] = [];
 
 // Clean standard boot log
 let dhcpConsoleLogs: { timestamp: string; level: 'INFO' | 'SUCCESS' | 'WARN'; message: string }[] = [
@@ -134,6 +140,7 @@ function loadState() {
       if (data.transferLogs) transferLogs = data.transferLogs;
       if (data.terminalHosts) terminalHosts = data.terminalHosts;
       if (data.commandScripts) commandScripts = data.commandScripts;
+      if (data.batchJobs) batchJobs = data.batchJobs;
       if (data.dhcpConsoleLogs) dhcpConsoleLogs = data.dhcpConsoleLogs;
       
       console.log("State restored successfully. AutoStart checks initiating...");
@@ -169,6 +176,7 @@ function saveState() {
       transferLogs,
       terminalHosts,
       commandScripts,
+      batchJobs,
       dhcpConsoleLogs
     };
     fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2), "utf-8");
@@ -181,14 +189,22 @@ function saveState() {
 loadState();
 
 // A persisted config may reference an adapter name from a previous run (or a
-// different PC entirely) that doesn't exist on this host anymore, or may carry
-// stale range/gateway values from before those were derived from the real adapter
-// (or from before this host's IP changed, e.g. a DHCP lease renewal from the real
-// router). Self-heal both instead of silently keeping phantom network settings.
-// Returns true if the config was changed.
+// different PC entirely) that doesn't exist on this host anymore. Self-heal by
+// falling back to a real default adapter (with fresh subnet defaults) in that
+// case. Returns true if the config was changed.
+//
+// NOTE: this deliberately does NOT compare dhcpConfig.gateway against the
+// adapter's current primary IP anymore. Under the gateway-alias model (see
+// ensureGatewayAliasOnAdapter), the Pool's gateway lives on the adapter as a
+// *secondary* IP alias — the adapter's own primary address (DHCP-obtained,
+// APIPA, or anything else) is expected to differ from it as a matter of
+// course, not as a sign of stale/broken config. Treating that normal
+// difference as "stale" used to silently overwrite the admin's saved Pool
+// settings with whatever throwaway address the adapter's primary happened to
+// have (that was the root cause of Pool settings resetting to 169.254.x.x).
 function ensureDhcpConfigMatchesHost(): boolean {
   let healInterfaceName = dhcpConfig.interfaceName;
-  let healHostInfo = getInterfaceInfo(healInterfaceName);
+  let healHostInfo = getInterfaceInfo(healInterfaceName, dhcpConfig.gateway);
   const fellBackToDefaultInterface = !healHostInfo;
   if (!healHostInfo) {
     healInterfaceName = getDefaultInterfaceName();
@@ -196,23 +212,8 @@ function ensureDhcpConfigMatchesHost(): boolean {
   }
   if (!healHostInfo) return false;
 
-  // The adapter can be legitimately stuck in APIPA (169.254.x.x) while the admin
-  // has already saved a real gateway in the DHCP Pool config — that's exactly the
-  // transient state /api/dhcp/toggle's netsh auto-fix step is meant to resolve, by
-  // pushing dhcpConfig.gateway onto the adapter. If we self-heal here first, we'd
-  // silently overwrite the admin's saved config with the adapter's throwaway APIPA
-  // address before netsh ever gets a chance to run, turning a normal "adapter
-  // hasn't been assigned yet" moment into permanent data loss. So: only self-heal
-  // on an APIPA host if we also had to fall back to a different adapter entirely
-  // (i.e. the persisted interfaceName is stale/from another host) — a saved,
-  // still-valid non-APIPA gateway for the *same* adapter is left alone.
-  const hostIsApipa = healHostInfo.ip.startsWith("169.254.");
-  const configGatewayIsValid = isValidIPv4(dhcpConfig.gateway) && !dhcpConfig.gateway.startsWith("169.254.");
-  if (hostIsApipa && configGatewayIsValid && !fellBackToDefaultInterface) {
-    return false;
-  }
-
-  if (dhcpConfig.gateway !== healHostInfo.ip) {
+  const needsFreshDefaults = fellBackToDefaultInterface || !isValidIPv4(dhcpConfig.gateway);
+  if (needsFreshDefaults) {
     dhcpConfig = {
       ...dhcpConfig,
       interfaceName: healInterfaceName,
@@ -423,7 +424,7 @@ function buildDhcpReply(opts: {
 
 function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: string) {
   if (!dhcpSocket) return;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
   if (!hostInfo) return;
 
   const buf = buildDhcpReply({
@@ -502,7 +503,7 @@ function handleDhcpDiscover(pkt: ParsedDhcpPacket) {
 
 function handleDhcpRequest(pkt: ParsedDhcpPacket) {
   const mac = pkt.chaddr;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
   if (!hostInfo) return;
 
   const serverIdOpt = pkt.options.get(54);
@@ -536,8 +537,19 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
     return;
   }
 
+  // DHCP option 12 (Host Name) is optional from the client's perspective — some
+  // devices send it on the very first DISCOVER/REQUEST but omit it on later
+  // renewal REQUESTs. Previously an absent option 12 unconditionally overwrote
+  // the lease with a generic "Device-X" name, permanently clobbering a real
+  // hostname learned earlier. Now: fall back to the existing lease's hostname
+  // (if any) before falling back to the generic name, so a real hostname
+  // already on file survives renewals that don't resend option 12. A hostname
+  // sent in *this* request (e.g. after the device rebooted with a new name)
+  // still always wins.
   const hostnameOpt = pkt.options.get(12);
-  const hostname = (hostnameOpt ? hostnameOpt.toString("utf8").replace(/[^\x20-\x7e]/g, "").trim() : "") || `Device-${requestedIp.split(".")[3]}`;
+  const parsedHostname = hostnameOpt ? hostnameOpt.toString("utf8").replace(/[^\x20-\x7e]/g, "").trim() : "";
+  const existingLease = leases.find(l => l.mac === mac && l.id !== 'host-pc-self');
+  const hostname = parsedHostname || existingLease?.hostname || `Device-${requestedIp.split(".")[3]}`;
 
   upsertLease(mac, requestedIp, hostname, isReservedForThisMac ? 'reserved' : 'active');
   logDhcp('SUCCESS', `DHCPREQUEST 수신: MAC ${mac} → DHCPACK ${requestedIp} 전송 (${hostname}, ${dhcpConfig.leaseTime}분 임대)`);
@@ -591,7 +603,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
       return;
     }
 
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
     if (!hostInfo) {
       resolve({ success: false, error: `인터페이스 [${dhcpConfig.interfaceName}]를 이 호스트에서 찾을 수 없습니다.` });
       return;
@@ -623,7 +635,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
         // filtered this way — that's covered by confining every reply to
         // the configured subnet's broadcast address instead.
         if (rinfo.address !== "0.0.0.0") {
-          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName);
+          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
           if (currentHost && !isIpInSubnet(rinfo.address, currentHost.ip, dhcpConfig.subnetMask)) {
             return;
           }
@@ -722,6 +734,7 @@ app.get("/api/status", (req, res) => {
     transferLogs,
     terminalHosts,
     commandScripts,
+    batchJobs,
     dhcpConsoleLogs
   });
 });
@@ -732,21 +745,30 @@ app.post("/api/system/console-log/clear", (req, res) => {
   res.json({ success: true, dhcpConsoleLogs });
 });
 
-// Helper to extract IP and MAC from selected interface name.
+// Helper to extract IP and MAC from selected interface name. An adapter can
+// carry more than one IPv4 address at once (its own DHCP/APIPA-assigned
+// primary, plus a secondary "gateway alias" this app may have added — see
+// ensureGatewayAliasOnAdapter below). When `preferredIp` is given and present
+// among this adapter's addresses, it's returned instead of just "whichever
+// the OS lists first" — every DHCP-engine call site passes dhcpConfig.gateway
+// here so the server consistently identifies itself by its Pool gateway IP
+// once that alias exists, regardless of what the adapter's primary address is.
 // Returns null when the adapter can't be found on this host — callers must handle
 // that explicitly instead of silently falling back to fabricated data.
-function getInterfaceInfo(name: string): { ip: string; mac: string; netmask: string } | null {
+function getInterfaceInfo(name: string, preferredIp?: string): { ip: string; mac: string; netmask: string } | null {
   try {
     const nets = os.networkInterfaces();
     const infos = nets[name];
     if (infos) {
-      let ipv4 = infos.find(info => info.family === "IPv4" && !info.internal);
-      if (!ipv4) ipv4 = infos.find(info => info.family === "IPv4");
-      if (ipv4) {
+      const ipv4s = infos.filter(info => info.family === "IPv4" && !info.internal);
+      let chosen = preferredIp ? ipv4s.find(info => info.address === preferredIp) : undefined;
+      if (!chosen) chosen = ipv4s[0];
+      if (!chosen) chosen = infos.find(info => info.family === "IPv4");
+      if (chosen) {
         return {
-          ip: ipv4.address,
-          mac: ipv4.mac || "00:00:00:00:00:00",
-          netmask: ipv4.netmask
+          ip: chosen.address,
+          mac: chosen.mac || "00:00:00:00:00:00",
+          netmask: chosen.netmask
         };
       }
     }
@@ -756,6 +778,18 @@ function getInterfaceInfo(name: string): { ip: string; mac: string; netmask: str
   return null;
 }
 
+// All non-internal IPv4 addresses currently bound to an adapter (its primary
+// plus any secondary aliases) — used to check whether the Pool's gateway IP
+// is already present before trying to add it again.
+function getAllInterfaceIPv4s(name: string): { ip: string; netmask: string }[] {
+  const nets = os.networkInterfaces();
+  const infos = nets[name];
+  if (!infos) return [];
+  return infos
+    .filter(info => info.family === "IPv4" && !info.internal)
+    .map(info => ({ ip: info.address, netmask: info.netmask }));
+}
+
 function isValidIPv4(ip: string): boolean {
   if (!ip) return false;
   const parts = ip.split(".");
@@ -763,33 +797,64 @@ function isValidIPv4(ip: string): boolean {
   return parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+// Tracks the gateway alias this process last added (if any), so switching the
+// Pool config to a different subnet/site can clean up the old alias instead of
+// leaving it behind on the adapter forever.
+let managedGatewayAlias: { interfaceName: string; ip: string } | null = null;
+
+function removeGatewayAlias(interfaceName: string, ip: string): Promise<void> {
+  return new Promise((resolve) => {
+    execFile("netsh", ["interface", "ip", "delete", "address", `name=${interfaceName}`, `addr=${ip}`], () => {
+      // Best-effort: if it's already gone (manually removed, adapter changed,
+      // etc.) netsh just errors harmlessly — nothing useful to do with that here.
+      resolve();
+    });
+  });
 }
 
-// Force the given adapter to a static IP via Windows `netsh`. Used when the
-// adapter is stuck in APIPA (169.254.x.x, i.e. no upstream DHCP server ever
-// assigned it a real address) — this app IS the DHCP server for the LAN, so it
-// must put its own gateway IP on the adapter itself rather than handing out a
-// 169.254.x.x gateway to the clients it serves. Requires admin rights (the app
-// already requires them to bind UDP port 67 for the DHCP engine itself).
-function assignStaticIpViaNetsh(interfaceName: string, ip: string, subnetMask: string): Promise<{ success: boolean; error?: string }> {
+// Make sure the configured adapter actually has the DHCP Pool's gateway IP
+// available, WITHOUT ever touching whatever primary address it already has
+// (DHCP-obtained, APIPA, or anything else). Rather than replacing the
+// adapter's own "obtain automatically" address with a static one (fragile:
+// Windows keeps fighting to renew/revert it, and every time this app is
+// pointed at a different site/subnet the whole adapter has to be
+// reconfigured), this adds the gateway as a *secondary* IP alias on the same
+// adapter. The adapter keeps whatever primary address it wants; the Pool's
+// gateway simply also lives there. Switching to a different Pool subnet later
+// just swaps which alias is present — the primary is never involved.
+async function ensureGatewayAliasOnAdapter(interfaceName: string, gateway: string, subnetMask: string): Promise<{ success: boolean; error?: string }> {
+  if (!isValidIPv4(gateway) || !isValidIPv4(subnetMask)) {
+    return { success: false, error: "게이트웨이 IP 또는 서브넷 마스크 형식이 올바르지 않습니다." };
+  }
+
+  const currentIps = getAllInterfaceIPv4s(interfaceName);
+  if (currentIps.some(i => i.ip === gateway)) {
+    // Already present — either the admin set it manually, or we added it in a
+    // previous cycle. Nothing to do.
+    managedGatewayAlias = { interfaceName, ip: gateway };
+    return { success: true };
+  }
+
+  // If we previously added an alias for a *different* subnet on this same
+  // adapter (the site/deployment changed), remove it first so aliases don't
+  // pile up indefinitely across repeated redeployments.
+  if (managedGatewayAlias && managedGatewayAlias.interfaceName === interfaceName && managedGatewayAlias.ip !== gateway) {
+    await removeGatewayAlias(interfaceName, managedGatewayAlias.ip);
+  }
+
   return new Promise((resolve) => {
-    if (!isValidIPv4(ip) || !isValidIPv4(subnetMask)) {
-      resolve({ success: false, error: "게이트웨이 IP 또는 서브넷 마스크 형식이 올바르지 않습니다." });
-      return;
-    }
-    // execFile (no shell) instead of exec — args are passed straight to the
-    // process, never interpreted for shell metacharacters, so a malformed or
-    // hostile subnetMask/interfaceName value can't break out into arbitrary
-    // command execution.
+    // execFile (no shell) — args are passed straight to the process, never
+    // interpreted for shell metacharacters, so a malformed or hostile
+    // subnetMask/interfaceName value can't break out into arbitrary command
+    // execution.
     execFile(
       "netsh",
-      ["interface", "ip", "set", "address", `name=${interfaceName}`, "static", ip, subnetMask],
+      ["interface", "ip", "add", "address", `name=${interfaceName}`, `addr=${gateway}`, `mask=${subnetMask}`],
       (error, stdout, stderr) => {
         if (error) {
           resolve({ success: false, error: (stderr && stderr.trim()) || error.message });
         } else {
+          managedGatewayAlias = { interfaceName, ip: gateway };
           resolve({ success: true });
         }
       }
@@ -834,7 +899,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
     // real interface IP the moment the service actually starts, in case it drifted
     // since boot (e.g. this PC's own IP was renewed by the real router's DHCP).
     ensureDhcpConfigMatchesHost();
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
 
     if (!hostInfo) {
       systemStatus.dhcpRunning = false;
@@ -851,66 +916,36 @@ app.post("/api/dhcp/toggle", async (req, res) => {
       });
     }
 
-    // If the adapter is set to "obtain IP automatically" and there is no real
-    // upstream DHCP server on the LAN, Windows self-assigns an APIPA address
-    // (169.254.x.x). Since this app IS the DHCP server, handing that out as the
-    // gateway to clients would be a serious misconfiguration — force the adapter
-    // to a real static IP (this DHCP Pool's own configured gateway/mask) first.
-    if (hostInfo.ip.startsWith("169.254.")) {
-      if (!isValidIPv4(dhcpConfig.gateway) || dhcpConfig.gateway.startsWith("169.254.")) {
-        dhcpConsoleLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'WARN',
-          message: `어댑터가 APIPA(${hostInfo.ip}) 상태이지만 DHCP Pool 설정의 게이트웨이(${dhcpConfig.gateway || '미지정'})가 유효하지 않아 자동 조치를 진행할 수 없습니다.`
-        });
-        saveState();
-        return res.json({
-          success: false,
-          error: "DHCP Pool 설정에서 유효한 게이트웨이 IP를 먼저 지정하세요 (169.254 대역 불가).",
-          systemStatus, dhcpConfig, leases, dhcpConsoleLogs
-        });
-      }
-
-      const netshResult = await assignStaticIpViaNetsh(dhcpConfig.interfaceName, dhcpConfig.gateway, dhcpConfig.subnetMask);
-      if (!netshResult.success) {
+    // Make sure the Pool's gateway IP is actually reachable on this adapter —
+    // as a secondary alias, never by touching the adapter's own primary
+    // address (see ensureGatewayAliasOnAdapter for why: replacing the
+    // "obtain automatically" primary with a static IP fought Windows
+    // constantly and had to be redone by hand every time this app was pointed
+    // at a different site/subnet).
+    if (hostInfo.ip !== dhcpConfig.gateway) {
+      const aliasResult = await ensureGatewayAliasOnAdapter(dhcpConfig.interfaceName, dhcpConfig.gateway, dhcpConfig.subnetMask);
+      if (!aliasResult.success) {
         systemStatus.dhcpRunning = false;
         dhcpConsoleLogs.push({
           timestamp: new Date().toISOString(),
           level: 'WARN',
-          message: `[자동 조치 실패] 어댑터를 고정 IP(${dhcpConfig.gateway})로 설정하지 못했습니다: ${netshResult.error || '알 수 없는 오류'} (관리자 권한으로 실행 중인지 확인하세요)`
+          message: `어댑터에 게이트웨이 보조 IP(${dhcpConfig.gateway})를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'} (관리자 권한으로 실행 중인지 확인하세요)`
         });
         saveState();
         return res.json({
           success: false,
-          error: `어댑터를 고정 IP로 설정하지 못했습니다: ${netshResult.error || '알 수 없는 오류'}`,
+          error: `어댑터에 게이트웨이 IP를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`,
           systemStatus, dhcpConfig, leases, dhcpConsoleLogs
         });
       }
 
-      // Windows may take a moment to actually apply the new address — poll a
-      // few times instead of assuming it's instantaneous, but proceed either way.
-      let confirmedInfo: { ip: string; mac: string; netmask: string } | null = null;
-      for (let attempt = 0; attempt < 5; attempt++) {
-        await sleep(500);
-        confirmedInfo = getInterfaceInfo(dhcpConfig.interfaceName);
-        if (confirmedInfo && confirmedInfo.ip === dhcpConfig.gateway) break;
-      }
-
-      if (confirmedInfo && confirmedInfo.ip === dhcpConfig.gateway) {
-        hostInfo.ip = confirmedInfo.ip;
-        hostInfo.netmask = confirmedInfo.netmask;
-      } else {
-        dhcpConsoleLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'WARN',
-          message: `[자동 조치] netsh 명령은 성공했지만 어댑터 IP가 아직 ${dhcpConfig.gateway}로 반영되지 않았습니다(적용 지연 가능). 일단 서비스 시작을 계속 진행합니다.`
-        });
-      }
+      const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+      if (refreshed) hostInfo = refreshed;
 
       dhcpConsoleLogs.push({
         timestamp: new Date().toISOString(),
         level: 'SUCCESS',
-        message: `[자동 조치] 어댑터가 APIPA(169.254.x.x) 상태였습니다. DHCP Pool 설정의 게이트웨이 IP(${dhcpConfig.gateway}/${dhcpConfig.subnetMask})를 이 어댑터에 고정 IP로 자동 설정했습니다.`
+        message: `[자동 조치] 어댑터에 DHCP Pool 게이트웨이(${dhcpConfig.gateway}/${dhcpConfig.subnetMask})를 보조 IP로 추가했습니다. 어댑터의 기존 기본 IP 설정(자동/DHCP 등)은 변경하지 않았습니다.`
       });
     }
 
@@ -992,10 +1027,10 @@ app.post("/api/dhcp/toggle", async (req, res) => {
   res.json({ success: true, systemStatus, dhcpConfig, leases, dhcpConsoleLogs });
 });
 
-app.post("/api/dhcp/config", (req, res) => {
+app.post("/api/dhcp/config", async (req, res) => {
   const newConfig: DhcpConfig = req.body;
   dhcpConfig = { ...dhcpConfig, ...newConfig };
-  
+
   dhcpConsoleLogs.push({
     timestamp: new Date().toISOString(),
     level: 'INFO',
@@ -1003,7 +1038,31 @@ app.post("/api/dhcp/config", (req, res) => {
   });
 
   if (systemStatus.dhcpRunning) {
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+
+    // The service is already running and the admin just pointed the Pool at a
+    // different gateway/subnet (e.g. redeploying this same box at a different
+    // site) — make sure the new gateway is present on the adapter immediately
+    // instead of requiring a stop/start cycle.
+    if (hostInfo && hostInfo.ip !== dhcpConfig.gateway) {
+      const aliasResult = await ensureGatewayAliasOnAdapter(dhcpConfig.interfaceName, dhcpConfig.gateway, dhcpConfig.subnetMask);
+      if (aliasResult.success) {
+        const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+        if (refreshed) hostInfo = refreshed;
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'SUCCESS',
+          message: `[자동 조치] 어댑터에 새 게이트웨이(${dhcpConfig.gateway}/${dhcpConfig.subnetMask})를 보조 IP로 추가했습니다.`
+        });
+      } else {
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'WARN',
+          message: `어댑터에 새 게이트웨이(${dhcpConfig.gateway}) 보조 IP를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`
+        });
+      }
+    }
+
     if (hostInfo) {
       const hostLeaseIdx = leases.findIndex(l => l.id === "host-pc-self" || l.mac === hostInfo.mac);
       const hostLease: DhcpLease = {
@@ -1160,7 +1219,7 @@ async function pingSweepLeases(): Promise<void> {
 // configured static IP that this DHCP server never issued and never will — the
 // only way to see their IP otherwise is digging through `arp -a` by hand.
 app.get("/api/dhcp/arp-table", async (req, res) => {
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
   if (!hostInfo) {
     return res.json({ entries: [] });
   }
@@ -1278,6 +1337,48 @@ app.delete("/api/dhcp/leases/:id", (req, res) => {
     level: 'INFO',
     message: `관리자가 IP 임대를 수동으로 반환했습니다: ${lease.ip} (MAC ${lease.mac}, ${lease.hostname})`
   });
+  saveState();
+  res.json({ success: true, leases, dhcpConsoleLogs });
+});
+
+// Manually "renew" a single lease as an admin action. Standard DHCP has no
+// server-initiated renewal (the client drives renewal), so this instead: (1)
+// pushes expiresAt back out by a full lease-time window as if a real renewal
+// had just happened, (2) retries reverse DNS and adopts the result only if
+// the current hostname is still an auto-generated "Device-N" placeholder
+// (never overwrites a real, already-known hostname — reverseDnsLookup isn't
+// guaranteed to be more accurate), and (3) pings the IP once for an immediate
+// online/lastCheckedAt refresh. Reuses reverseDnsLookup/isValidIPv4/execFile
+// already defined above rather than duplicating logic.
+app.post("/api/dhcp/leases/:id/renew", async (req, res) => {
+  const lease = leases.find(l => l.id === req.params.id);
+  if (!lease) {
+    return res.status(404).json({ error: "해당 임대 정보를 찾을 수 없습니다." });
+  }
+
+  lease.expiresAt = new Date(Date.now() + dhcpConfig.leaseTime * 60000).toISOString();
+
+  const resolvedHostname = await reverseDnsLookup(lease.ip);
+  if (resolvedHostname && /^Device-\d+$/.test(lease.hostname)) {
+    lease.hostname = resolvedHostname;
+  }
+
+  if (isValidIPv4(lease.ip)) {
+    await new Promise<void>((resolve) => {
+      execFile("ping", ["-n", "1", "-w", "800", lease.ip], (error, stdout) => {
+        lease.online = !error && /TTL=/i.test(stdout || "");
+        lease.lastCheckedAt = new Date().toISOString();
+        resolve();
+      });
+    });
+  }
+
+  dhcpConsoleLogs.push({
+    timestamp: new Date().toISOString(),
+    level: 'SUCCESS',
+    message: `IP ${lease.ip} (${lease.hostname}) 임대를 관리자가 수동으로 갱신했습니다.`
+  });
+
   saveState();
   res.json({ success: true, leases, dhcpConsoleLogs });
 });
@@ -1644,6 +1745,28 @@ app.put("/api/scripts/:id", (req, res) => {
   res.json({ success: true, commandScripts });
 });
 
+// Saved Batch Jobs ("device list + script" combo, replayed with one click).
+// Purely CRUD here — execution stays a frontend fan-out over the existing
+// /api/scripts/execute endpoint (see TerminalAutomation.tsx).
+app.post("/api/batch-jobs", (req, res) => {
+  const { name, hostIds, scriptId } = req.body;
+  if (!name || !Array.isArray(hostIds) || hostIds.length === 0 || !scriptId) {
+    return res.status(400).json({ error: "name, hostIds(1개 이상), scriptId가 필요합니다." });
+  }
+
+  const job: BatchJob = { id: "batch-" + Date.now(), name, hostIds, scriptId };
+  batchJobs.push(job);
+  saveState();
+  res.json({ success: true, batchJobs });
+});
+
+app.delete("/api/batch-jobs/:id", (req, res) => {
+  const { id } = req.params;
+  batchJobs = batchJobs.filter(j => j.id !== id);
+  saveState();
+  res.json({ success: true, batchJobs });
+});
+
 // Automation Script Execution Engine
 // Real SSH (ssh2) / Telnet (telnet-client) automation. No canned/simulated
 // output: every log line below either comes from the remote device or from
@@ -1730,6 +1853,46 @@ function closeLiveSession(execId: string, logMessage?: string) {
   }
 }
 
+// Clean up raw bytes coming back from real network gear (switches/routers)
+// before they hit the log/UI. Devices commonly send ANSI/VT100 escape
+// sequences (cursor movement, colors), backspace characters used to erase
+// "--More--" paging prompts or echoed input, and other C0 control bytes —
+// none of which render sensibly as plain text in the web log viewer. This is
+// deliberately practical rather than a full terminal emulator: backspace
+// handling only unwinds within a single chunk (no cross-chunk state), which
+// is enough to clean up the common paging/erase patterns real devices use.
+function sanitizeTerminalOutput(raw: string): string {
+  let text = raw;
+
+  // ANSI CSI sequences (cursor movement, colors, clear-line, etc.)
+  text = text.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, "");
+  // ANSI OSC sequences (window title, etc.), terminated by BEL or ST
+  text = text.replace(/\x1b\][^\x07\x1b]*(\x07|\x1b\\)/g, "");
+  // Charset designation and other 2-byte escapes, then any leftover lone escape byte
+  text = text.replace(/\x1b[()][0-9A-Za-z]/g, "");
+  text = text.replace(/\x1b./g, "");
+
+  // Interpret backspace (\x08) the way a real terminal would: erase the
+  // previously accumulated character instead of leaving it in the stream.
+  let unwound = "";
+  for (const ch of text) {
+    if (ch === "\x08") {
+      unwound = unwound.slice(0, -1);
+    } else {
+      unwound += ch;
+    }
+  }
+  text = unwound;
+
+  // Normalize line endings
+  text = text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+
+  // Strip remaining C0 control characters, keeping \n and \t
+  text = text.replace(/[\x00-\x08\x0b-\x1f]/g, "");
+
+  return text;
+}
+
 // Run an interactive SSH shell session: connect, push each command in order
 // (streaming whatever the device actually returns into the log), then — once
 // every scripted command has been sent — keep the shell open and register it
@@ -1778,8 +1941,8 @@ function runSshExecution(
       conn.shell((err, stream) => {
         if (err) return settleOnce(err);
 
-        stream.on("data", (data: Buffer) => appendLog(data.toString()));
-        stream.stderr?.on("data", (data: Buffer) => appendLog(data.toString()));
+        stream.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
+        stream.stderr?.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
         stream.on("error", (streamErr: any) => handleSessionEnd(streamErr));
         stream.on("close", () => handleSessionEnd());
 
@@ -1895,7 +2058,7 @@ function runTelnetExecution(
       saveState();
     };
 
-    connection.on("data", (data: Buffer) => appendLog(data.toString()));
+    connection.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
     // Registering these before connect() also prevents Node from throwing on
     // an unhandled 'error' event once the connection is kept open past the
     // initial connect() call.
@@ -2228,8 +2391,8 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
             finish({ success: false, error: describeConnectionError(err, host) });
             return;
           }
-          stream.on("data", (data: Buffer) => { output += data.toString(); });
-          stream.stderr?.on("data", (data: Buffer) => { output += data.toString(); });
+          stream.on("data", (data: Buffer) => { output += sanitizeTerminalOutput(data.toString()); });
+          stream.stderr?.on("data", (data: Buffer) => { output += sanitizeTerminalOutput(data.toString()); });
           stream.on("error", (streamErr: any) => finish({ success: false, error: describeConnectionError(streamErr, host) }));
 
           stream.write("terminal length 0\n");
@@ -2284,7 +2447,7 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
   return (async () => {
     const connection = new Telnet();
     let output = "";
-    connection.on("data", (data: Buffer) => { output += data.toString(); });
+    connection.on("data", (data: Buffer) => { output += sanitizeTerminalOutput(data.toString()); });
 
     try {
       await connection.connect({
