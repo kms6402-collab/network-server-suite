@@ -114,7 +114,7 @@ npm run clean         # dist, server.js, applet_state.json, served_folder 삭제
 - 도메인 타입은 `src/types.ts` 한 곳에 전부 정의되어 있고 프론트엔드/백엔드가 같은 타입 정의를 참조한다(`server.ts`가 `./src/types.js`를 import).
 - 컴포넌트 구성: `Dashboard`(전체 상태 요약), `DhcpServer`(DHCP 설정/실단말 탐지/예약), `FileServer`(TFTP/FTP 파일 관리, 공유 폴더 편집), `TerminalAutomation`(SSH/Telnet 호스트 및 실제 스크립트 실행), `SystemSettings`.
 - 스타일은 Tailwind CSS v4(`@tailwindcss/vite` 플러그인), 아이콘은 `lucide-react`, 애니메이션은 `motion` 사용.
-- `@google/genai` 의존성과 `.env.example`의 `GEMINI_API_KEY`/`APP_URL`은 AI Studio 템플릿이 남긴 흔적이며, `server.ts`/`src/**` 어디에서도 실제로 import하거나 사용하지 않는다(grep으로 확인). README는 `GEMINI_API_KEY` 설정을 안내하지만 이 앱을 구동하는 데 **필수가 아니다** — `.env` 없이도 `npm run dev`/`build:exe` 모두 정상 동작한다.
+- AI Studio 템플릿이 남겼던 흔적(`@google/genai`/`dotenv` 의존성, `.env.example`의 `GEMINI_API_KEY`/`APP_URL`, `metadata.json`, `index.html`의 "My Google AI Studio App" 타이틀, AI Studio 안내문이던 `README.md`, `vite.config.ts`의 `DISABLE_HMR` 분기)은 모두 제거됐다 — 이 앱은 Gemini API나 AI Studio 런타임과 무관하게 독립적으로 동작하며, `.env` 없이도 `npm run dev`/`build:exe` 모두 정상 동작한다.
 
 ## Windows EXE 빌드 시 아이콘 적용 (중요, 비직관적인 부분)
 

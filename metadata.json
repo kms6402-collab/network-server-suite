@@ -1,6 +1,0 @@
-{
-  "name": "Network Server Suite",
-  "description": "DHCP, TFTP, FTP service manager with SSH/Telnet automated terminal and network logs console.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
