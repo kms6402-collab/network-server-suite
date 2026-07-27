@@ -9,5 +9,9 @@ coverage/
 
 # Runtime state and packaged output — not source, shouldn't live in git history
 applet_state.json
+setting.ini
 served_folder/
 *.exe
+
+# Claude Code session-local files — not project source
+.claude/

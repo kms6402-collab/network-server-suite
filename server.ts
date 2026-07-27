@@ -40,6 +40,7 @@ app.use(express.json());
 const isPackagedForPaths = !!(process as any).pkg;
 const appBaseDir = isPackagedForPaths ? path.dirname(process.execPath) : process.cwd();
 const STATE_FILE = path.join(appBaseDir, "applet_state.json");
+const SETTINGS_FILE = path.join(appBaseDir, "setting.ini");
 const SERVED_FOLDER = path.join(appBaseDir, "served_folder");
 
 // Create served folder if it doesn't exist (clean, no dummy seed files)
@@ -127,6 +128,48 @@ let dhcpConsoleLogs: { timestamp: string; level: 'INFO' | 'SUCCESS' | 'WARN'; me
   { timestamp: new Date().toISOString(), level: 'INFO', message: 'DHCP service initialized.' }
 ];
 
+// Minimal INI reader/writer — no external dependency. Sections hold flat
+// key=value pairs; array/object config (terminalHosts, commandScripts, etc.)
+// is stored as a single JSON-encoded string value within its own section, so
+// it round-trips exactly while the simple scalar settings (DHCP pool, TFTP/FTP
+// config) stay genuinely human-readable/editable in a text editor. This file
+// is a secondary safety net alongside applet_state.json — see saveState/loadState.
+function stringifyIni(sections: Record<string, Record<string, string>>): string {
+  const lines: string[] = [];
+  for (const [section, kv] of Object.entries(sections)) {
+    lines.push(`[${section}]`);
+    for (const [key, value] of Object.entries(kv)) {
+      // INI values are single-line — escape any embedded newlines so a JSON
+      // blob (e.g. terminalHosts) can't corrupt the file structure.
+      const safeValue = String(value).replace(/\r?\n/g, "\\n");
+      lines.push(`${key}=${safeValue}`);
+    }
+    lines.push("");
+  }
+  return lines.join("\r\n");
+}
+
+function parseIni(text: string): Record<string, Record<string, string>> {
+  const result: Record<string, Record<string, string>> = {};
+  let currentSection: string | null = null;
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith(";") || line.startsWith("#")) continue;
+    const sectionMatch = line.match(/^\[(.+)\]$/);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1];
+      result[currentSection] = result[currentSection] || {};
+      continue;
+    }
+    const eqIdx = line.indexOf("=");
+    if (eqIdx === -1 || !currentSection) continue;
+    const key = line.slice(0, eqIdx).trim();
+    const value = line.slice(eqIdx + 1).replace(/\\n/g, "\n");
+    result[currentSection][key] = value;
+  }
+  return result;
+}
+
 // Load state from file (Fulfills system recovery and automatic starting configuration)
 function loadState() {
   try {
@@ -142,9 +185,9 @@ function loadState() {
       if (data.commandScripts) commandScripts = data.commandScripts;
       if (data.batchJobs) batchJobs = data.batchJobs;
       if (data.dhcpConsoleLogs) dhcpConsoleLogs = data.dhcpConsoleLogs;
-      
+
       console.log("State restored successfully. AutoStart checks initiating...");
-      
+
       // Auto-start services if they were running or if configured to always run on boot
       if (systemStatus.autoStart) {
         systemStatus.dhcpRunning = true;
@@ -156,6 +199,75 @@ function loadState() {
           timestamp: new Date().toISOString(),
           level: 'SUCCESS',
           message: 'System recovered from restart. Auto-started DHCP Server.'
+        });
+      }
+    } else if (fs.existsSync(SETTINGS_FILE)) {
+      // applet_state.json is missing (fresh install, moved exe without it, the
+      // JSON write failed previously, etc.) but the human-readable setting.ini
+      // safety net exists — restore as much as possible from it rather than
+      // silently starting from a blank slate.
+      try {
+        const sections = parseIni(fs.readFileSync(SETTINGS_FILE, "utf-8"));
+        if (sections.DhcpConfig) {
+          const s = sections.DhcpConfig;
+          dhcpConfig = {
+            ...dhcpConfig,
+            ...(s.interfaceName && { interfaceName: s.interfaceName }),
+            ...(s.rangeStart && { rangeStart: s.rangeStart }),
+            ...(s.rangeEnd && { rangeEnd: s.rangeEnd }),
+            ...(s.subnetMask && { subnetMask: s.subnetMask }),
+            ...(s.gateway && { gateway: s.gateway }),
+            ...(s.dns && { dns: s.dns }),
+            ...(s.leaseTime && { leaseTime: Number(s.leaseTime) || dhcpConfig.leaseTime })
+          };
+        }
+        if (sections.TftpFtpConfig) {
+          const s = sections.TftpFtpConfig;
+          tftpFtpConfig = {
+            ...tftpFtpConfig,
+            ...(s.tftpEnabled !== undefined && { tftpEnabled: s.tftpEnabled === "true" }),
+            ...(s.ftpEnabled !== undefined && { ftpEnabled: s.ftpEnabled === "true" }),
+            ...(s.rootFolder && { rootFolder: s.rootFolder }),
+            ...(s.tftpPort && { tftpPort: Number(s.tftpPort) || tftpFtpConfig.tftpPort }),
+            ...(s.ftpPort && { ftpPort: Number(s.ftpPort) || tftpFtpConfig.ftpPort })
+          };
+        }
+        if (sections.System?.autoStart !== undefined) {
+          systemStatus.autoStart = sections.System.autoStart === "true";
+        }
+        if (sections.Reservations?.data) reservations = JSON.parse(sections.Reservations.data);
+        if (sections.TerminalHosts?.data) terminalHosts = JSON.parse(sections.TerminalHosts.data);
+        if (sections.CommandScripts?.data) commandScripts = JSON.parse(sections.CommandScripts.data);
+        if (sections.BatchJobs?.data) batchJobs = JSON.parse(sections.BatchJobs.data);
+
+        console.log("State restored from setting.ini fallback (applet_state.json not found).");
+
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'SUCCESS',
+          message: `applet_state.json이 없어 설정 파일(${SETTINGS_FILE})에서 설정을 복원했습니다.`
+        });
+
+        // Auto-start services if configured to always run on boot, same as the
+        // applet_state.json restore path above.
+        if (systemStatus.autoStart) {
+          systemStatus.dhcpRunning = true;
+          systemStatus.tftpRunning = true;
+          systemStatus.ftpRunning = true;
+          tftpFtpConfig.tftpEnabled = true;
+          tftpFtpConfig.ftpEnabled = true;
+          dhcpConsoleLogs.push({
+            timestamp: new Date().toISOString(),
+            level: 'SUCCESS',
+            message: 'System recovered from restart. Auto-started DHCP Server.'
+          });
+        }
+      } catch (iniLoadError) {
+        console.error("Failed to load setting.ini fallback", iniLoadError);
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'WARN',
+          message: `설정 파일(setting.ini) 복원에 실패했습니다: ${(iniLoadError as Error).message}. 경로: ${SETTINGS_FILE}`
         });
       }
     }
@@ -182,6 +294,51 @@ function saveState() {
     fs.writeFileSync(STATE_FILE, JSON.stringify(data, null, 2), "utf-8");
   } catch (error) {
     console.error("Failed to save state", error);
+    dhcpConsoleLogs.push({
+      timestamp: new Date().toISOString(),
+      level: 'WARN',
+      message: `상태 파일(applet_state.json) 저장에 실패했습니다: ${(error as Error).message}. 경로: ${STATE_FILE}`
+    });
+  }
+
+  // Secondary, independent safety net: also persist the settings as a
+  // human-readable setting.ini next to the exe. This must not share a
+  // try-catch with the JSON save above — either one failing (permissions,
+  // encoding, disk issue, etc.) must not prevent the other from succeeding.
+  try {
+    const iniSections: Record<string, Record<string, string>> = {
+      DhcpConfig: {
+        interfaceName: dhcpConfig.interfaceName,
+        rangeStart: dhcpConfig.rangeStart,
+        rangeEnd: dhcpConfig.rangeEnd,
+        subnetMask: dhcpConfig.subnetMask,
+        gateway: dhcpConfig.gateway,
+        dns: dhcpConfig.dns,
+        leaseTime: String(dhcpConfig.leaseTime)
+      },
+      TftpFtpConfig: {
+        tftpEnabled: String(tftpFtpConfig.tftpEnabled),
+        ftpEnabled: String(tftpFtpConfig.ftpEnabled),
+        rootFolder: tftpFtpConfig.rootFolder,
+        tftpPort: String(tftpFtpConfig.tftpPort),
+        ftpPort: String(tftpFtpConfig.ftpPort)
+      },
+      System: {
+        autoStart: String(systemStatus.autoStart)
+      },
+      Reservations: { data: JSON.stringify(reservations) },
+      TerminalHosts: { data: JSON.stringify(terminalHosts) },
+      CommandScripts: { data: JSON.stringify(commandScripts) },
+      BatchJobs: { data: JSON.stringify(batchJobs) }
+    };
+    fs.writeFileSync(SETTINGS_FILE, stringifyIni(iniSections), "utf-8");
+  } catch (iniError) {
+    console.error("Failed to save setting.ini", iniError);
+    dhcpConsoleLogs.push({
+      timestamp: new Date().toISOString(),
+      level: 'WARN',
+      message: `설정 파일(setting.ini) 저장에 실패했습니다: ${(iniError as Error).message}. 경로: ${SETTINGS_FILE}`
+    });
   }
 }
 
@@ -797,16 +954,77 @@ function isValidIPv4(ip: string): boolean {
   return parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
 }
 
+// Converts a dotted-decimal subnet mask (e.g. "255.255.255.0") into a CIDR
+// prefix length (e.g. 24), as required by New-NetIPAddress -PrefixLength.
+// Returns null if the mask isn't a well-formed IPv4 dotted-decimal value.
+function subnetMaskToPrefixLength(mask: string): number | null {
+  if (!isValidIPv4(mask)) return null;
+  const octets = mask.split(".").map(Number);
+  let value = 0;
+  for (const o of octets) value = (value << 8) | o;
+  // Force unsigned 32-bit interpretation (the top octet can push the shift
+  // result negative in JS's 32-bit bitwise semantics).
+  value = value >>> 0;
+  let prefix = 0;
+  for (let i = 31; i >= 0; i--) {
+    if ((value & (1 << i)) !== 0) prefix++;
+  }
+  return prefix;
+}
+
+// Runs a PowerShell script via -EncodedCommand (Base64 UTF-16LE), so
+// interface names / IPs containing quotes or other shell-special characters
+// can never be misinterpreted or break out of the invocation — there's no
+// shell parsing of the payload at all, unlike passing raw text as -Command.
+function runPowerShellScript(script: string): Promise<{ success: boolean; stdout: string; stderr: string; error?: string }> {
+  return new Promise((resolve) => {
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      (error, stdout, stderr) => {
+        resolve({ success: !error, stdout: (stdout || "").trim(), stderr: (stderr || "").trim(), error: error?.message });
+      }
+    );
+  });
+}
+
+// Defensive escaping for values embedded inside PowerShell single-quoted
+// string literals: even though -EncodedCommand removes any shell-injection
+// risk, a literal single quote in the value would still break out of the
+// ' ... ' literal and corrupt the script, so double it per PowerShell's own
+// quoting rules.
+function escapePowerShellSingleQuoted(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
 // Tracks the gateway alias this process last added (if any), so switching the
 // Pool config to a different subnet/site can clean up the old alias instead of
 // leaving it behind on the adapter forever.
 let managedGatewayAlias: { interfaceName: string; ip: string } | null = null;
 
-function removeGatewayAlias(interfaceName: string, ip: string): Promise<void> {
-  return new Promise((resolve) => {
-    execFile("netsh", ["interface", "ip", "delete", "address", `name=${interfaceName}`, `addr=${ip}`], () => {
-      // Best-effort: if it's already gone (manually removed, adapter changed,
-      // etc.) netsh just errors harmlessly — nothing useful to do with that here.
+// Best-effort removal of a gateway alias IP from an adapter. Tries the
+// modern PowerShell NetTCPIP cmdlet first (Remove-NetIPAddress), falling back
+// to the legacy netsh command if PowerShell fails for any reason. Never
+// throws — if the IP is already gone (manually removed, adapter changed,
+// etc.) both approaches just fail harmlessly and there's nothing useful to
+// do with that here, so failures are merely logged.
+async function removeGatewayAlias(interfaceName: string, ip: string): Promise<void> {
+  const psScript = `Remove-NetIPAddress -IPAddress '${escapePowerShellSingleQuoted(ip)}' -Confirm:$false -ErrorAction Stop`;
+  const psResult = await runPowerShellScript(psScript);
+  if (psResult.success) {
+    logDhcp("INFO", `게이트웨이 보조 IP(${ip}) 제거 성공 (PowerShell Remove-NetIPAddress, 어댑터: ${interfaceName}).`);
+    return;
+  }
+  logDhcp("WARN", `게이트웨이 보조 IP(${ip}) 제거 - PowerShell 방식 실패 (어댑터: ${interfaceName}): ${psResult.stderr || psResult.error || "알 수 없는 오류"}. netsh 방식으로 재시도합니다.`);
+
+  await new Promise<void>((resolve) => {
+    execFile("netsh", ["interface", "ip", "delete", "address", `name=${interfaceName}`, `addr=${ip}`], (error, stdout, stderr) => {
+      if (error) {
+        logDhcp("WARN", `게이트웨이 보조 IP(${ip}) 제거 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${(stderr && stderr.trim()) || error.message}. (이미 제거되어 있었을 수도 있습니다.)`);
+      } else {
+        logDhcp("INFO", `게이트웨이 보조 IP(${ip}) 제거 성공 (netsh 폴백, 어댑터: ${interfaceName}).`);
+      }
       resolve();
     });
   });
@@ -822,6 +1040,17 @@ function removeGatewayAlias(interfaceName: string, ip: string): Promise<void> {
 // adapter. The adapter keeps whatever primary address it wants; the Pool's
 // gateway simply also lives there. Switching to a different Pool subnet later
 // just swaps which alias is present — the primary is never involved.
+//
+// Two mechanisms are tried, in order:
+//   1. PowerShell's New-NetIPAddress (NetTCPIP module, Windows 8/Server 2012+).
+//      This is the modern, reliably-supported way to add a secondary static
+//      IP on an adapter that's otherwise getting its primary address via
+//      DHCP — the legacy netsh "interface ip add address" command is known to
+//      fail or behave unpredictably in exactly that situation.
+//   2. The legacy netsh command, kept as a fallback for hosts/environments
+//      where PowerShell or the NetTCPIP module is unavailable.
+// If both fail, the returned error string includes full diagnostic detail
+// from both attempts plus a hint to check for administrator privileges.
 async function ensureGatewayAliasOnAdapter(interfaceName: string, gateway: string, subnetMask: string): Promise<{ success: boolean; error?: string }> {
   if (!isValidIPv4(gateway) || !isValidIPv4(subnetMask)) {
     return { success: false, error: "게이트웨이 IP 또는 서브넷 마스크 형식이 올바르지 않습니다." };
@@ -835,11 +1064,30 @@ async function ensureGatewayAliasOnAdapter(interfaceName: string, gateway: strin
     return { success: true };
   }
 
+  logDhcp("INFO", `게이트웨이 보조 IP(${gateway}/${subnetMask}) 추가 시도 - 어댑터 '${interfaceName}'에 현재 잡혀있는 IPv4 주소: ${currentIps.length > 0 ? currentIps.map(i => `${i.ip} (mask ${i.netmask})`).join(", ") : "(없음)"}`);
+
   // If we previously added an alias for a *different* subnet on this same
   // adapter (the site/deployment changed), remove it first so aliases don't
   // pile up indefinitely across repeated redeployments.
   if (managedGatewayAlias && managedGatewayAlias.interfaceName === interfaceName && managedGatewayAlias.ip !== gateway) {
     await removeGatewayAlias(interfaceName, managedGatewayAlias.ip);
+  }
+
+  const prefixLength = subnetMaskToPrefixLength(subnetMask);
+  let psFailureDetail = "";
+  if (prefixLength === null) {
+    psFailureDetail = `서브넷 마스크(${subnetMask})를 CIDR prefix length로 변환할 수 없습니다.`;
+    logDhcp("WARN", `게이트웨이 보조 IP 추가 - PowerShell 방식 건너뜀 (어댑터: ${interfaceName}): ${psFailureDetail}`);
+  } else {
+    const psScript = `New-NetIPAddress -InterfaceAlias '${escapePowerShellSingleQuoted(interfaceName)}' -IPAddress '${escapePowerShellSingleQuoted(gateway)}' -PrefixLength ${prefixLength} -ErrorAction Stop | Out-Null`;
+    const psResult = await runPowerShellScript(psScript);
+    if (psResult.success) {
+      managedGatewayAlias = { interfaceName, ip: gateway };
+      logDhcp("SUCCESS", `PowerShell(New-NetIPAddress) 방식으로 게이트웨이 보조 IP(${gateway}/${prefixLength}) 추가 성공 (어댑터: ${interfaceName}).`);
+      return { success: true };
+    }
+    psFailureDetail = psResult.stderr || psResult.error || "알 수 없는 오류";
+    logDhcp("WARN", `게이트웨이 보조 IP 추가 - PowerShell(New-NetIPAddress) 방식 실패 (어댑터: ${interfaceName}): ${psFailureDetail}. netsh 방식으로 재시도합니다.`);
   }
 
   return new Promise((resolve) => {
@@ -852,9 +1100,13 @@ async function ensureGatewayAliasOnAdapter(interfaceName: string, gateway: strin
       ["interface", "ip", "add", "address", `name=${interfaceName}`, `addr=${gateway}`, `mask=${subnetMask}`],
       (error, stdout, stderr) => {
         if (error) {
-          resolve({ success: false, error: (stderr && stderr.trim()) || error.message });
+          const netshFailureDetail = (stderr && stderr.trim()) || error.message;
+          const combinedError = `PowerShell 방식 실패: ${psFailureDetail}. netsh 방식도 실패: ${netshFailureDetail}. 관리자 권한으로 실행 중인지 확인하세요.`;
+          logDhcp("WARN", `게이트웨이 보조 IP 추가 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${netshFailureDetail}`);
+          resolve({ success: false, error: combinedError });
         } else {
           managedGatewayAlias = { interfaceName, ip: gateway };
+          logDhcp("SUCCESS", `netsh(폴백) 방식으로 게이트웨이 보조 IP(${gateway}) 추가 성공 (어댑터: ${interfaceName}).`);
           resolve({ success: true });
         }
       }
