@@ -519,16 +519,20 @@ export default function App() {
     }
   };
 
-  const handleExecuteScript = async (hostId: string, scriptId: string) => {
+  const handleExecuteScript = async (hostId: string, scriptId: string): Promise<string | null> => {
     try {
-      await fetch('/api/scripts/execute', {
+      const res = await fetch('/api/scripts/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId, scriptId })
       });
       fetchAllState();
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.executionId ?? null;
     } catch (e) {
       console.error(e);
+      return null;
     }
   };
 
@@ -702,10 +706,10 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.1.2 Enterprise
+                v2.2.0 Enterprise
               </span>
             </h1>
-            <p className="text-xs text-slate-400 mt-1">통합 DHCP, TFTP, FTP 데몬 관리 및 CRT 자동화 텔넷/SSH 콘솔</p>
+            <p className="text-xs text-slate-400 mt-1">DHCP · TFTP/FTP · SSH/Telnet 자동화</p>
           </div>
         </div>
 

@@ -501,13 +501,13 @@ export default function DhcpServer({
           </div>
           <div>
             <h2 className="text-lg font-display font-bold text-white flex items-center gap-2">
-              DHCP 자동 IP 임대 서버
+              DHCP 서버
               <span className={`text-xs px-2.5 py-0.5 rounded-full font-sans font-semibold tracking-wide ${dhcpRunning ? 'bg-emerald-500/10 text-emerald-400 border border-emerald-900' : 'bg-rose-500/10 text-rose-400 border border-rose-900'}`}>
-                {dhcpRunning ? '● 서버 가동중' : '○ 서버 일시 중지'}
+                {dhcpRunning ? '● 가동중' : '○ 중지됨'}
               </span>
             </h2>
             <p className="text-xs text-slate-400 mt-1">
-              활성화 인터페이스 <strong className="text-indigo-400 font-mono">{config.interfaceName}</strong>를 통해 로컬 스위치 단말에 IP를 자동으로 임대하고 관리합니다.
+              <strong className="text-indigo-400 font-mono">{config.interfaceName}</strong>에서 IP 자동 임대
             </p>
           </div>
         </div>
@@ -523,7 +523,7 @@ export default function DhcpServer({
             }`}
           >
             <Server className="w-4 h-4" />
-            {dhcpRunning ? '임대 서비스 정지' : '임대 서비스 가동'}
+            {dhcpRunning ? '중지' : '가동'}
           </button>
         </div>
       </div>
@@ -534,10 +534,10 @@ export default function DhcpServer({
           <div>
             <h3 className="text-sm font-display font-bold text-indigo-300 uppercase tracking-wider flex items-center gap-1.5">
               <Wifi className="w-4 h-4 text-emerald-400" />
-              실제 네트워크 단말 탐지 (Live Device Discovery)
+              네트워크 단말 탐지
             </h3>
             <p className="text-xs text-slate-400 mt-0.5">
-              서비스가 가동 중이면 약 4초 간격으로 현재 네트워크(ARP 테이블)에서 실제로 통신 중인 단말을 자동으로 탐지해 아래 목록에 반영하고, 약 6초 간격으로 각 단말의 온라인 상태(ping)를 갱신합니다.
+              가동 중 자동으로 단말을 탐지하고 온라인 상태를 갱신합니다.
             </p>
           </div>
           <button
@@ -559,9 +559,9 @@ export default function DhcpServer({
           <div>
             <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
               <Settings className="w-3.5 h-3.5 text-indigo-400" />
-              DHCP IP 주소 풀 및 서버 구성 설정 (Horizontal Config Panel)
+              DHCP 주소 풀 설정
             </h3>
-            <p className="text-[10px] text-slate-400 mt-0.5">네트워크 인터페이스 IP 대역과 서브넷 마스크 범위를 매핑합니다.</p>
+            <p className="text-[10px] text-slate-400 mt-0.5">IP 대역과 서브넷을 설정합니다.</p>
           </div>
           <span className="text-[9px] text-indigo-400 bg-indigo-950/40 border border-indigo-900/40 px-2 py-0.5 rounded font-mono font-bold">
             Gateway/Server: {gateway || '미지정'}
@@ -690,10 +690,10 @@ export default function DhcpServer({
           <div>
             <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5 text-emerald-400" />
-              IP 주소 사용 현황 바둑판 맵 (IP Address Allocation Map)
+              IP 주소 현황
             </h3>
             <p className="text-[10px] text-slate-400 mt-0.5">
-              설정된 IP 임대 풀 대역(<strong className="text-emerald-400 font-mono">{rangeStart} ~ {rangeEnd}</strong>) 내의 개별 IP 주소 점유 및 여유 현황입니다.
+              임대 풀(<strong className="text-emerald-400 font-mono">{rangeStart} ~ {rangeEnd}</strong>) 내 IP 점유 현황
             </p>
           </div>
 
@@ -701,19 +701,19 @@ export default function DhcpServer({
           <div className="flex flex-wrap items-center gap-3 text-[9px] text-slate-400 bg-slate-950/40 p-2 rounded-lg border border-slate-850/40">
             <div className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded bg-emerald-500/20 border border-emerald-500/40"></span>
-              <span>동적 할당 중 (Active Leased)</span>
+              <span>동적 할당</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded bg-indigo-500/20 border border-indigo-500/40"></span>
-              <span>고정 IP 예약 (Static Reserved)</span>
+              <span>고정 예약</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded bg-sky-500/20 border border-sky-500/40"></span>
-              <span>본인 제어단말 (Self Node)</span>
+              <span>본인 단말</span>
             </div>
             <div className="flex items-center gap-1.5">
               <span className="w-2 h-2 rounded bg-slate-800/40 border border-slate-700/40"></span>
-              <span>임대 여유 (Available)</span>
+              <span>여유</span>
             </div>
             <div className="flex items-center gap-1.5 ml-auto">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -767,7 +767,7 @@ export default function DhcpServer({
               </div>
             ) : (
               <div className="text-center text-slate-500 py-4 text-xs bg-slate-950/40 border border-slate-850 rounded-xl">
-                IP 대역 형식이 올바르지 않거나 설정이 완료되지 않았습니다.
+                IP 대역 설정이 올바르지 않습니다.
               </div>
             );
           })()}
@@ -781,9 +781,9 @@ export default function DhcpServer({
             <div>
               <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
                 <Wifi className="w-3.5 h-3.5 text-emerald-400" />
-                실시간 할당 단말 정보 현황 ({filteredLeases.length} Active Leases)
+                할당 단말 ({filteredLeases.length}개)
               </h3>
-              <p className="text-[10px] text-slate-400 mt-0.5">네트워크 망에 정상적으로 통신 IP를 할당받은 단말 정보 목록입니다.</p>
+              <p className="text-[10px] text-slate-400 mt-0.5">IP를 할당받은 단말 목록</p>
             </div>
             
             <div className="flex items-center gap-2">
@@ -792,7 +792,7 @@ export default function DhcpServer({
                 <Search className="w-3 h-3 text-slate-500 absolute left-2 top-1/2 -translate-y-1/2" />
                 <input
                   type="text"
-                  placeholder="단말 검색 (이름, IP, MAC)"
+                  placeholder="검색 (이름/IP/MAC)"
                   value={searchTerm}
                   onChange={(e) => setSearchTerm(e.target.value)}
                   className="bg-slate-950 border border-slate-850 text-[10px] rounded-lg pl-7 pr-3 py-1.5 text-white w-[160px] focus:outline-none focus:border-indigo-500 transition"
@@ -1051,10 +1051,10 @@ export default function DhcpServer({
             <div>
               <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
                 <Layers className="w-3.5 h-3.5 text-indigo-400" />
-                ARP 캐시 테이블 (같은 네트워크 전체 단말)
+                ARP 캐시 (전체 단말)
               </h3>
               <p className="text-[10px] text-slate-400 mt-0.5">
-                이 DHCP 서버가 임대/예약으로 관리하지 않는, 즉 고정(정적) IP를 수동으로 설정한 단말도 포함해 같은 네트워크에서 실제로 통신 중인 모든 단말을 보여줍니다. 5초마다 자동 갱신됩니다.
+                고정 IP 단말 포함, 같은 네트워크의 모든 단말을 5초마다 갱신합니다.
               </p>
             </div>
             {arpLoading && (
@@ -1093,7 +1093,7 @@ export default function DhcpServer({
                 {arpEntries.length === 0 && (
                   <tr>
                     <td colSpan={3} className="text-center text-slate-500 py-6 text-xs">
-                      {arpLoading ? 'ARP 테이블을 조회하는 중입니다...' : '탐지된 단말이 없습니다.'}
+                      {arpLoading ? '조회 중...' : '탐지된 단말 없음'}
                     </td>
                   </tr>
                 )}
@@ -1107,16 +1107,16 @@ export default function DhcpServer({
           <div>
             <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
               <Database className="w-3.5 h-3.5 text-indigo-400" />
-              고정 IP 주소 바인딩 예약 (IP Static Reservations)
+              고정 IP 예약
             </h3>
-            <p className="text-[10px] text-slate-400 mt-0.5">특정 핵심 장비(예: 메인 DB, 공유 프린터, 스위치)의 MAC을 매핑하여 항상 동일한 고정 IP가 부여되도록 설정합니다.</p>
+            <p className="text-[10px] text-slate-400 mt-0.5">MAC 주소로 항상 같은 IP를 부여합니다.</p>
           </div>
 
           <div className="space-y-3">
             {/* Horizontal inline input fields for addition */}
             <form onSubmit={handleAddReservation} className="grid grid-cols-1 sm:grid-cols-4 gap-3 bg-slate-950/40 border border-slate-850/60 p-3 rounded-xl text-xs" id="add-reservation-form">
               <div>
-                <label className="block text-slate-400 font-bold mb-1 text-[10px]">대상 호스트 명칭</label>
+                <label className="block text-slate-400 font-bold mb-1 text-[10px]">호스트명</label>
                 <input 
                   type="text" 
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
@@ -1127,7 +1127,7 @@ export default function DhcpServer({
                 />
               </div>
               <div>
-                <label className="block text-slate-400 font-bold mb-1 text-[10px]">장치 MAC 주소</label>
+                <label className="block text-slate-400 font-bold mb-1 text-[10px]">MAC 주소</label>
                 <input 
                   type="text" 
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
@@ -1138,7 +1138,7 @@ export default function DhcpServer({
                 />
               </div>
               <div>
-                <label className="block text-slate-400 font-bold mb-1 text-[10px]">지정할 고정 IP</label>
+                <label className="block text-slate-400 font-bold mb-1 text-[10px]">고정 IP</label>
                 <input 
                   type="text" 
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
@@ -1155,7 +1155,7 @@ export default function DhcpServer({
                   className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition shadow h-[34px] flex items-center justify-center gap-1 cursor-pointer text-xs"
                 >
                   <Plus className="w-3.5 h-3.5" />
-                  IP 고정 바인딩 추가
+                  추가
                 </button>
               </div>
             </form>
@@ -1165,10 +1165,10 @@ export default function DhcpServer({
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-900/60 text-slate-300 border-b border-slate-850/60 font-bold text-[10px]">
                   <tr>
-                    <th className="p-2.5 pl-3">대상 장비 호스트명</th>
-                    <th className="p-2.5">매핑된 고정 IP 주소 (Static IP)</th>
-                    <th className="p-2.5">물리 MAC 주소</th>
-                    <th className="p-2.5 text-right pr-3">관리 조작</th>
+                    <th className="p-2.5 pl-3">호스트명</th>
+                    <th className="p-2.5">IP 주소</th>
+                    <th className="p-2.5">MAC</th>
+                    <th className="p-2.5 text-right pr-3">관리</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-850/30 text-slate-300 text-[11px]">
@@ -1195,7 +1195,7 @@ export default function DhcpServer({
                   ))}
                   {reservations.length === 0 && (
                     <tr>
-                      <td colSpan={4} className="text-center text-slate-500 py-6">현재 수동 등록된 고정 IP가 존재하지 않습니다.</td>
+                      <td colSpan={4} className="text-center text-slate-500 py-6">등록된 고정 IP 없음</td>
                     </tr>
                   )}
                 </tbody>
@@ -1228,12 +1228,12 @@ export default function DhcpServer({
                 </h3>
                 {neighborModal.mode === 'result' && (
                   <p className="text-[10px] text-slate-500 mt-0.5">
-                    일반 PC/서버 등 비-네트워크 장비는 "지원하지 않는 명령입니다" 류의 출력이 그대로 나올 수 있으며, 이는 정상입니다.
+                    PC/서버 등은 미지원 출력이 나올 수 있습니다 (정상).
                   </p>
                 )}
                 {neighborModal.mode === 'form' && (
                   <p className="text-[10px] text-slate-500 mt-0.5">
-                    이 단말({neighborModal.lease.ip})은 등록된 SSH/Telnet 장비 목록에 없어 접속 계정 정보가 필요합니다. 입력한 정보는 저장되지 않고 이번 조회 1회에만 사용됩니다.
+                    미등록 단말입니다. 계정 정보는 이번 조회에만 사용되며 저장되지 않습니다.
                   </p>
                 )}
               </div>
@@ -1320,12 +1320,12 @@ export default function DhcpServer({
               {neighborModal.mode === 'loading' && (
                 <div className="flex flex-col items-center justify-center gap-3 text-slate-400 text-xs py-12">
                   <RefreshCw className="w-6 h-6 animate-spin text-sky-400" />
-                  <p>장비에 접속하여 CDP/LLDP 정보를 수집 중입니다... (약 5초 소요될 수 있습니다)</p>
+                  <p>정보 수집 중... (약 5초)</p>
                 </div>
               )}
               {neighborModal.mode === 'result' && neighborResult && neighborResult.success && (
                 <pre className="whitespace-pre-wrap break-all font-mono text-[11px] text-emerald-300/90 leading-relaxed">
-                  {neighborResult.output || '(응답 없음 — 장비가 CDP/LLDP 명령을 지원하지 않거나 이웃 장비가 없을 수 있습니다.)'}
+                  {neighborResult.output || '(응답 없음)'}
                 </pre>
               )}
               {neighborModal.mode === 'result' && neighborResult && !neighborResult.success && (
