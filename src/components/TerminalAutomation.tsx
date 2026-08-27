@@ -23,7 +23,7 @@ interface TerminalAutomationProps {
   onAddScript: (name: string, description: string, commands: string[]) => void;
   onUpdateScript: (id: string, name: string, description: string, commands: string[]) => void;
   onRemoveScript: (id: string) => void;
-  onExecuteScript: (hostId: string, scriptId: string) => void;
+  onExecuteScript: (hostId: string, scriptId: string) => Promise<string | null>;
   onManualConnect: (hostId: string) => void;
   onSendManualCommand: (execIds: string[], command: string) => void;
   onDisconnectSession: (execId: string) => void;
@@ -131,6 +131,60 @@ export default function TerminalAutomation({
 
   const activeExec = executions.find(e => e.id === activeTabId);
   const openSessionCount = executions.filter(e => e.sessionOpen).length;
+
+  // Sequential batch runner state: unlike the old staggered fan-out (all
+  // hosts fired ~200ms apart, running concurrently), this queues one host at
+  // a time and waits for its execution to reach a terminal status before
+  // starting the next, so many devices no longer open dozens of simultaneous
+  // sessions at once (see the session-tab layout report this replaced).
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; hostName: string } | null>(null);
+  const batchCancelRef = useRef(false);
+  // Kept in sync with the `executions` prop so the polling-based wait loop
+  // below always reads the latest snapshot without re-subscribing per tick.
+  const executionsRef = useRef(executions);
+  useEffect(() => { executionsRef.current = executions; }, [executions]);
+
+  // Polls until the execution reaches a terminal status. `seen` guards
+  // against the race right after dispatch, where the parent's `executions`
+  // state hasn't picked up the brand-new record yet — without it, "not found"
+  // on the very first tick would be misread as "already finished" and the
+  // whole queue would fire almost simultaneously instead of one at a time.
+  const waitForExecutionSettled = (execId: string, timeoutMs = 5 * 60 * 1000) => {
+    return new Promise<void>((resolve) => {
+      const start = Date.now();
+      let seen = false;
+      const tick = () => {
+        if (batchCancelRef.current) { resolve(); return; }
+        const exec = executionsRef.current.find(e => e.id === execId);
+        if (exec) seen = true;
+        const settled = (seen && !exec) || (!!exec && (exec.status === 'completed' || exec.status === 'failed'));
+        if (settled || Date.now() - start > timeoutMs) { resolve(); return; }
+        setTimeout(tick, 400);
+      };
+      tick();
+    });
+  };
+
+  // Runs a script across many hosts one at a time: start host N, wait for its
+  // execution to finish (completed/failed), then move on to host N+1.
+  const runBatchSequential = async (hostIds: string[], scriptId: string) => {
+    if (batchRunning || hostIds.length === 0) return;
+    setBatchRunning(true);
+    batchCancelRef.current = false;
+    setBatchJobError(null);
+    for (let i = 0; i < hostIds.length; i++) {
+      if (batchCancelRef.current) break;
+      const hostId = hostIds[i];
+      setBatchProgress({ current: i + 1, total: hostIds.length, hostName: getHostNameFromId(hostId) });
+      const execId = await onExecuteScript(hostId, scriptId);
+      if (execId) {
+        await waitForExecutionSettled(execId);
+      }
+    }
+    setBatchRunning(false);
+    setBatchProgress(null);
+  };
 
   // Update defaults when hosts/scripts load
   useEffect(() => {
@@ -372,14 +426,7 @@ export default function TerminalAutomation({
   const handleRunScript = () => {
     if (!selectedScriptId) return;
     if (batchModeActive) {
-      // Backend already supports independent per-host sessions/tabs, so this
-      // is a pure frontend fan-out: dispatch one execute call per selected
-      // host, staggered slightly so the requests don't all land in the same
-      // tick.
-      const targetHostIds: string[] = Array.from(selectedHostIds);
-      targetHostIds.forEach((hostId, idx) => {
-        setTimeout(() => onExecuteScript(hostId, selectedScriptId), idx * 200);
-      });
+      runBatchSequential(Array.from(selectedHostIds), selectedScriptId);
       return;
     }
     if (!selectedHostId) return;
@@ -405,22 +452,20 @@ export default function TerminalAutomation({
   };
 
   // Re-run a saved batch job: filter out hosts/scripts that may have been
-  // removed since the job was saved, then fan out onExecuteScript calls the
-  // same staggered way handleRunScript does for the live multi-select.
+  // removed since the job was saved, then run them sequentially the same way
+  // handleRunScript does for the live multi-select.
   const handleRunSavedBatchJob = (job: BatchJob) => {
     if (!scripts.some(s => s.id === job.scriptId)) {
-      setBatchJobError(`"${job.name}" 배치 작업이 참조하는 스크립트가 더 이상 존재하지 않습니다.`);
+      setBatchJobError(`"${job.name}" 스크립트가 삭제되었습니다.`);
       return;
     }
     const targetHostIds = job.hostIds.filter(id => hosts.some(h => h.id === id));
     if (targetHostIds.length === 0) {
-      setBatchJobError(`"${job.name}" 배치 작업에 포함된 장비가 더 이상 존재하지 않습니다.`);
+      setBatchJobError(`"${job.name}" 장비가 삭제되었습니다.`);
       return;
     }
     setBatchJobError(null);
-    targetHostIds.forEach((hostId, idx) => {
-      setTimeout(() => onExecuteScript(hostId, job.scriptId), idx * 200);
-    });
+    runBatchSequential(targetHostIds, job.scriptId);
   };
 
   const handleSendManualCommand = (e: React.FormEvent) => {
@@ -476,7 +521,7 @@ export default function TerminalAutomation({
           <div className="flex items-center justify-between border-b border-slate-855 pb-2.5">
             <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
               <Server className="w-4 h-4 text-emerald-400" />
-              자동화 접속 대상 장비 (Devices)
+              대상 장비 (Devices)
             </h3>
             <div className="flex items-center gap-2.5">
               <button
@@ -493,7 +538,7 @@ export default function TerminalAutomation({
                 className="text-emerald-400 hover:text-emerald-300 text-xs font-bold flex items-center gap-0.5 cursor-pointer transition"
               >
                 <Wifi className="w-3.5 h-3.5" />
-                DHCP 클라이언트에서 가져오기
+                DHCP에서 가져오기
               </button>
               <button
                 id="show-host-form-btn"
@@ -520,7 +565,7 @@ export default function TerminalAutomation({
           {showDhcpImportPanel ? (
             <form onSubmit={handleDhcpImportSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[340px]" id="dhcp-import-form">
               <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">
-                DHCP 임대 클라이언트 선택 후 일괄 등록
+                DHCP 임대 선택 후 등록
               </span>
 
               <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold">
@@ -551,7 +596,7 @@ export default function TerminalAutomation({
                   </label>
                 ))}
                 {importableLeases.length === 0 && (
-                  <div className="text-slate-500 text-center py-4 text-[10px]">가져올 수 있는 DHCP 임대 클라이언트가 없습니다.</div>
+                  <div className="text-slate-500 text-center py-4 text-[10px]">가져올 DHCP 임대가 없습니다.</div>
                 )}
               </div>
 
@@ -629,7 +674,7 @@ export default function TerminalAutomation({
           ) : showBulkUpdateForm ? (
             <form onSubmit={handleBulkUpdateSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[340px]" id="bulk-update-host-form">
               <span className="text-[11px] font-bold text-indigo-400 uppercase tracking-wider block">
-                선택 장비 {selectedHostIds.size}개 계정 정보 일괄 수정
+                선택 장비 {selectedHostIds.size}개 일괄 수정
               </span>
               <p className="text-[10px] text-slate-500">비워두면 해당 항목은 변경하지 않습니다.</p>
 
@@ -702,7 +747,7 @@ export default function TerminalAutomation({
           ) : showHostForm ? (
             <form onSubmit={handleAddHostSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[300px]" id="add-host-form">
               <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">
-                {editingHostId ? "장비 정보 수정" : "신규 SSH/Telnet 장비 추가"}
+                {editingHostId ? "장비 정보 수정" : "장비 추가"}
               </span>
               <div className="grid grid-cols-2 gap-2">
                 <div>
@@ -826,7 +871,7 @@ export default function TerminalAutomation({
                       className="px-2 py-1 bg-slate-800 hover:bg-indigo-950/40 hover:text-indigo-300 disabled:opacity-30 disabled:pointer-events-none text-slate-300 rounded-lg font-bold flex items-center gap-1 cursor-pointer transition"
                     >
                       <PencilLine className="w-3 h-3" />
-                      선택 항목 일괄 수정
+                      일괄 수정
                     </button>
                     <button
                       id="bulk-delete-hosts-btn"
@@ -836,7 +881,7 @@ export default function TerminalAutomation({
                       className="px-2 py-1 bg-slate-800 hover:bg-rose-950/40 hover:text-rose-300 disabled:opacity-30 disabled:pointer-events-none text-slate-300 rounded-lg font-bold flex items-center gap-1 cursor-pointer transition"
                     >
                       <Trash2 className="w-3 h-3" />
-                      선택 항목 일괄 삭제
+                      일괄 삭제
                     </button>
                   </div>
                 </div>
@@ -893,7 +938,7 @@ export default function TerminalAutomation({
                 </div>
               ))}
               {hosts.length === 0 && (
-                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 SSH/Telnet 장비가 존재하지 않습니다.</div>
+                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 장비가 없습니다.</div>
               )}
               </div>
             </div>
@@ -905,7 +950,7 @@ export default function TerminalAutomation({
           <div className="flex items-center justify-between border-b border-slate-855 pb-2.5">
             <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
               <Terminal className="w-4 h-4 text-emerald-400" />
-              배포 설정 자동화 스크립트 (Scripts)
+              자동화 스크립트 (Scripts)
             </h3>
             <button
               id="show-script-form-btn"
@@ -921,7 +966,7 @@ export default function TerminalAutomation({
             <form onSubmit={handleAddScriptSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[300px]" id="add-script-form">
               <div className="flex justify-between items-center">
                 <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">
-                  {editingScriptId ? "자동화 스크립트 수정" : "신규 자동화 스크립트 작성"}
+                  {editingScriptId ? "스크립트 수정" : "스크립트 작성"}
                 </span>
               </div>
               <div>
@@ -1004,7 +1049,7 @@ export default function TerminalAutomation({
                 </div>
               ))}
               {scripts.length === 0 && (
-                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 환경설정 자동화 스크립트 템플릿이 없습니다.</div>
+                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 스크립트가 없습니다.</div>
               )}
             </div>
           )}
@@ -1015,10 +1060,10 @@ export default function TerminalAutomation({
           <div className="space-y-3">
             <h3 className="text-sm font-display font-bold text-white border-b border-slate-855 pb-2.5 flex items-center gap-1.5">
               <ShieldCheck className="w-4 h-4 text-indigo-400 animate-pulse" />
-              원격 CRT 자동화 일괄 배치 실행기
+              배치 실행기
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              저장된 SSH/Telnet 프로필과 자동화 명령 스크립트를 선택한 뒤 <strong>배치 실행</strong> 버튼을 누르면, 백엔드 세션 스레드가 생성되어 원격 타겟 장비에 순차적으로 자동화 배포 명령을 밀어넣고 로그를 기록합니다.
+              장비와 스크립트를 선택 후 실행하세요. 여러 대 선택 시 한 대씩 순차 실행됩니다.
             </p>
 
             <div className="space-y-2.5 pt-2">
@@ -1032,12 +1077,12 @@ export default function TerminalAutomation({
                     className="accent-indigo-500 cursor-pointer"
                   />
                   <CheckSquare className="w-3 h-3" />
-                  선택된 {selectedHostIds.size}개 장비 전체에 일괄 실행
+                  선택 {selectedHostIds.size}개 장비 순차 실행
                 </label>
               )}
 
               <div className={batchModeActive ? "opacity-40 pointer-events-none transition" : "transition"}>
-                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">대상 네트워크 스위치/라우터 선택</label>
+                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">대상 장비</label>
                 <select
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white text-xs focus:outline-none focus:border-indigo-500 transition"
                   value={selectedHostId}
@@ -1052,13 +1097,13 @@ export default function TerminalAutomation({
               </div>
 
               <div>
-                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">자동 배포 스크립트 선택</label>
+                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">스크립트</label>
                 <select
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white text-xs focus:outline-none focus:border-indigo-500 transition"
                   value={selectedScriptId}
                   onChange={(e) => setSelectedScriptId(e.target.value)}
                 >
-                  <option value="" disabled>스크립트 템플릿 선택</option>
+                  <option value="" disabled>스크립트 선택</option>
                   {scripts.map(s => (
                     <option key={s.id} value={s.id}>{s.name} ({s.commands.length} lines)</option>
                   ))}
@@ -1067,28 +1112,51 @@ export default function TerminalAutomation({
             </div>
           </div>
 
-          <button
-            id="run-automation-btn"
-            onClick={handleRunScript}
-            disabled={!selectedScriptId || (!batchModeActive && !selectedHostId)}
-            className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:pointer-events-none active:bg-emerald-700 text-white rounded-xl font-bold tracking-wider text-xs flex items-center justify-center gap-2 cursor-pointer transition duration-150 shadow-lg shadow-emerald-950/20"
-          >
-            <Play className="w-4 h-4 text-emerald-100" />
-            {batchModeActive
-              ? `선택된 ${selectedHostIds.size}개 장비에 일괄 배치 실행 (RUN BATCH)`
-              : '배치 자동화 CLI 배포 실행 (RUN BATCH)'}
-          </button>
+          <div className="space-y-2">
+            {batchRunning && batchProgress && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-[11px] text-slate-400">
+                  <span className="truncate">{batchProgress.current}/{batchProgress.total} · {batchProgress.hostName}</span>
+                  <button
+                    type="button"
+                    id="cancel-batch-run-btn"
+                    onClick={() => { batchCancelRef.current = true; }}
+                    className="text-rose-400 hover:text-rose-300 cursor-pointer font-bold shrink-0"
+                  >
+                    중지
+                  </button>
+                </div>
+                <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
+                  <div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}></div>
+                </div>
+              </div>
+            )}
 
-          {selectedHostIds.size > 0 && selectedScriptId && (
             <button
-              id="save-batch-job-btn"
-              onClick={handleSaveCurrentAsBatchJob}
-              className="w-full py-2 bg-slate-850 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-xl font-bold tracking-wider text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition duration-150"
+              id="run-automation-btn"
+              onClick={handleRunScript}
+              disabled={!selectedScriptId || (!batchModeActive && !selectedHostId) || batchRunning}
+              className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:pointer-events-none active:bg-emerald-700 text-white rounded-xl font-bold tracking-wider text-xs flex items-center justify-center gap-2 cursor-pointer transition duration-150 shadow-lg shadow-emerald-950/20"
             >
-              <Save className="w-3.5 h-3.5 text-indigo-300" />
-              이 조합을 배치 작업으로 저장 ({selectedHostIds.size}개 장비)
+              <Play className="w-4 h-4 text-emerald-100" />
+              {batchRunning
+                ? `실행 중 (${batchProgress?.current ?? 0}/${batchProgress?.total ?? 0})`
+                : batchModeActive
+                  ? `선택 ${selectedHostIds.size}개 순차 실행`
+                  : '배치 실행'}
             </button>
-          )}
+
+            {selectedHostIds.size > 0 && selectedScriptId && (
+              <button
+                id="save-batch-job-btn"
+                onClick={handleSaveCurrentAsBatchJob}
+                className="w-full py-2 bg-slate-850 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-xl font-bold tracking-wider text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition duration-150"
+              >
+                <Save className="w-3.5 h-3.5 text-indigo-300" />
+                배치 작업으로 저장 ({selectedHostIds.size}개)
+              </button>
+            )}
+          </div>
         </div>
       </div>
 
@@ -1096,7 +1164,7 @@ export default function TerminalAutomation({
       <div className="p-5 glass-card rounded-2xl space-y-3">
         <h3 className="text-sm font-display font-bold text-white border-b border-slate-855 pb-2.5 flex items-center gap-1.5">
           <Bookmark className="w-4 h-4 text-indigo-400" />
-          저장된 배치 작업 (Saved Batch Jobs)
+          저장된 배치 작업
         </h3>
         {batchJobError && (
           <div className="p-2.5 rounded-lg border border-rose-900/50 bg-rose-950/30 text-rose-300 text-xs flex items-center justify-between gap-2">
@@ -1122,7 +1190,8 @@ export default function TerminalAutomation({
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleRunSavedBatchJob(job)}
-                      className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 cursor-pointer transition"
+                      disabled={batchRunning}
+                      className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:pointer-events-none active:bg-emerald-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 cursor-pointer transition"
                     >
                       <Play className="w-3 h-3" />
                       실행
@@ -1149,9 +1218,9 @@ export default function TerminalAutomation({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-855 pb-3">
           <div className="shrink-0 max-w-full sm:max-w-[45%]">
             <h3 className="text-sm font-display font-bold text-white">
-              실시간 원격 CLI 세션 뷰어 (SecureCRT Interactive Terminal Emulator)
+              실시간 세션 뷰어
             </h3>
-            <p className="text-[11px] text-slate-400 mt-0.5">동시에 구동 중인 여러 장비의 CLI 원격 세션 상태와 진행 상세 로그</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">장비별 세션 상태와 로그</p>
           </div>
 
           {/* Active session tabs selection */}
@@ -1277,7 +1346,7 @@ export default function TerminalAutomation({
               {activeExec.status === 'running' && (
                 <div className="flex items-center gap-2 text-amber-300 text-xs py-2 animate-pulse">
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>원격 장비가 CLI 응답 패킷을 연산 중입니다... ({activeExec.currentCommand})</span>
+                  <span>명령 실행 중... ({activeExec.currentCommand})</span>
                 </div>
               )}
             </div>
@@ -1293,7 +1362,7 @@ export default function TerminalAutomation({
                   className="accent-indigo-500 cursor-pointer"
                 />
                 <Radio className="w-3 h-3 text-indigo-400" />
-                모든 활성 세션에 동시 전송 (Broadcast to all sessions{openSessionCount > 0 ? ` · ${openSessionCount}개 연결됨` : ''})
+                전체 세션 동시 전송{openSessionCount > 0 ? ` (${openSessionCount}개 연결됨)` : ''}
               </label>
               <form onSubmit={handleSendManualCommand} className="flex gap-2" id="manual-cli-form">
                 <div className="flex-1 bg-slate-950 border border-slate-850 rounded-xl flex items-center px-3 gap-2">
@@ -1303,8 +1372,8 @@ export default function TerminalAutomation({
                     className="w-full bg-transparent border-0 text-white font-mono text-xs focus:outline-none py-2.5 disabled:opacity-40"
                     placeholder={
                       activeExec.sessionOpen
-                        ? "대화식 수동 명령을 장비에 직접 송출합니다... (e.g., show run-config, ping 8.8.8.8)"
-                        : "세션이 종료되어 수동 명령을 보낼 수 없습니다. 장비 목록에서 다시 접속하세요."
+                        ? "명령어 입력 (예: show run, ping 8.8.8.8)"
+                        : "세션 종료됨 - 다시 접속하세요"
                     }
                     value={manualCommand}
                     onChange={(e) => setManualCommand(e.target.value)}
@@ -1324,7 +1393,7 @@ export default function TerminalAutomation({
               {!activeExec.sessionOpen && (
                 <div className="flex items-center gap-1.5 text-[10px] text-slate-500">
                   <AlertCircle className="w-3 h-3" />
-                  이 세션의 연결이 종료되어 더 이상 명령을 보낼 수 없습니다.
+                  세션이 종료되어 명령을 보낼 수 없습니다.
                 </div>
               )}
             </div>
@@ -1333,8 +1402,8 @@ export default function TerminalAutomation({
           <div className="bg-slate-950/40 border border-slate-850/80 rounded-2xl py-16 text-center text-slate-500 text-xs font-mono flex flex-col items-center justify-center gap-3">
             <Terminal className="w-8 h-8 text-slate-600 animate-pulse" />
             <div className="leading-relaxed">
-              활성 또는 과거 터미널 세션이 선택되지 않았습니다.<br/>
-              상단 실행기에서 배치 스크립트를 작동시키거나, 장비 목록의 "수동 접속" 버튼으로 세션을 개설하십시오.
+              선택된 세션이 없습니다.<br/>
+              스크립트를 실행하거나 "수동 접속"으로 세션을 여세요.
             </div>
           </div>
         )}
@@ -1355,7 +1424,7 @@ export default function TerminalAutomation({
                 배치 작업으로 저장
               </h3>
               <p className="text-[11px] text-slate-400">
-                선택된 {selectedHostIds.size}개 장비 + 스크립트 조합에 이름을 붙여 저장합니다. 다음부터는 이 이름으로 한 번에 다시 실행할 수 있습니다.
+                {selectedHostIds.size}개 장비 + 스크립트 조합을 이름으로 저장합니다.
               </p>
               <input
                 type="text"

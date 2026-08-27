@@ -85,10 +85,10 @@ export default function Dashboard({
           <Activity className="w-4 h-4 text-emerald-400 animate-pulse shrink-0" />
           <div className="min-w-0">
             <h2 className="text-sm font-display font-bold text-white tracking-tight truncate">
-              실시간 서비스 모니터링 (Live Service Monitor)
+              실시간 서비스 모니터링
             </h2>
             <p className="text-[10px] text-slate-400 truncate hidden sm:block">
-              네트워크 백엔드 인프라가 정상적으로 가동 중이며, 클라이언트 대기 모드입니다.
+              정상 가동 중, 클라이언트 대기 중입니다.
             </p>
           </div>
         </div>
@@ -189,9 +189,9 @@ export default function Dashboard({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-850 pb-2 mb-2.5">
           <h3 className="text-xs font-display font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
             <Power className="w-3.5 h-3.5 text-indigo-400" />
-            원클릭 개별 서비스 제어 (Service Control Panel)
+            서비스 제어
           </h3>
-          <span className="text-[10px] text-slate-500">포트 바인딩 및 동작 모드 즉시 변환</span>
+          <span className="text-[10px] text-slate-500">즉시 켜고 끄기</span>
         </div>
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
           {/* DHCP Controller */}
@@ -253,9 +253,9 @@ export default function Dashboard({
           <div>
             <h3 className="text-xs font-display font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
               <Network className="w-3.5 h-3.5 text-indigo-400" />
-              최근 DHCP 주소 할당 단말 현황 (Recent Leases Summary)
+              최근 DHCP 할당 현황
             </h3>
-            <p className="text-[10px] text-slate-400">서버로부터 유효한 IP 임대 라이선스를 부여받고 통신을 활성화한 실시간 단말 목록입니다.</p>
+            <p className="text-[10px] text-slate-400">IP를 할당받은 단말 목록입니다.</p>
           </div>
           {onNavigateToTab && (
             <button
@@ -271,11 +271,11 @@ export default function Dashboard({
           <table className="w-full text-left text-xs">
             <thead className="bg-slate-900/60 border-b border-slate-850 text-slate-300 font-bold text-[10px]">
               <tr>
-                <th className="p-2.5 pl-3">단말 호스트명 (Hostname)</th>
+                <th className="p-2.5 pl-3">호스트명</th>
                 <th className="p-2.5">단말 종류</th>
-                <th className="p-2.5">할당 IP 주소</th>
-                <th className="p-2.5">맥 주소 (MAC)</th>
-                <th className="p-2.5 text-right pr-3">임대 만료 시간</th>
+                <th className="p-2.5">IP 주소</th>
+                <th className="p-2.5">MAC 주소</th>
+                <th className="p-2.5 text-right pr-3">만료 시간</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-850/30">
@@ -320,7 +320,7 @@ export default function Dashboard({
               {leases.length === 0 && (
                 <tr>
                   <td colSpan={5} className="text-center text-slate-500 py-8 text-xs font-medium">
-                    현재 할당된 DHCP 단말 정보가 존재하지 않습니다.
+                    할당된 단말이 없습니다.
                   </td>
                 </tr>
               )}
@@ -336,7 +336,7 @@ export default function Dashboard({
           <div className="flex items-center justify-between mb-2 border-b border-slate-850 pb-1.5">
             <h3 className="text-xs font-display font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
               <Terminal className="w-3.5 h-3.5 text-indigo-400" />
-              실시간 네트워크 로그 (System & DHCP Logs)
+              실시간 네트워크 로그
             </h3>
             <div className="flex items-center gap-2">
               <span className="text-[9px] text-slate-500 font-mono hidden sm:inline">Real-time terminal standard out</span>
@@ -368,7 +368,7 @@ export default function Dashboard({
               </div>
             ))}
             {consoleLogs.length === 0 && (
-              <div className="text-slate-500 text-center py-6">출력된 새로운 로그가 없습니다.</div>
+              <div className="text-slate-500 text-center py-6">로그가 없습니다.</div>
             )}
           </div>
         </div>
@@ -378,7 +378,7 @@ export default function Dashboard({
           <div className="flex items-center justify-between mb-2 border-b border-slate-850 pb-1.5">
             <h3 className="text-xs font-display font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
               <Layers className="w-3.5 h-3.5 text-emerald-400" />
-              최근 파일 전송 이력 (FTP/TFTP Transfers)
+              최근 파일 전송 이력
             </h3>
             <div className="flex items-center gap-2">
               <span className="text-[10px] text-slate-400">
@@ -399,9 +399,9 @@ export default function Dashboard({
               <thead className="bg-slate-900/80 border-b border-slate-850 text-slate-400 font-bold text-[10px] sticky top-0">
                 <tr>
                   <th className="p-2 pl-3">서비스</th>
-                  <th className="p-2">전송 파일 명 (File Name)</th>
+                  <th className="p-2">파일명</th>
                   <th className="p-2">파일 크기</th>
-                  <th className="p-2">타겟 클라이언트 IP</th>
+                  <th className="p-2">클라이언트 IP</th>
                   <th className="p-2 text-right pr-3">상태 및 속도</th>
                 </tr>
               </thead>
@@ -448,7 +448,7 @@ export default function Dashboard({
                 {transferLogs.length === 0 && (
                   <tr>
                     <td colSpan={5} className="text-center text-slate-500 py-6 text-xs">
-                      파일 전송 이력이 존재하지 않습니다.
+                      전송 이력이 없습니다.
                     </td>
                   </tr>
                 )}
