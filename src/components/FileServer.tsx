@@ -86,7 +86,7 @@ export default function FileServer({
           </h3>
           <form onSubmit={handleUpdateConfig} className="space-y-4 text-xs" id="tftp-config-form">
             <div>
-              <label className="block text-slate-300 font-bold mb-1.5">파일 저장 공유 폴더 (Server Root Directory)</label>
+              <label className="block text-slate-300 font-bold mb-1.5">공유 폴더 경로</label>
               <input
                 type="text"
                 className="w-full bg-slate-950 border border-slate-850 rounded-xl p-2.5 text-white font-mono text-xs focus:outline-none focus:border-indigo-500/80 focus:ring-1 focus:ring-indigo-500/40 transition"
@@ -94,7 +94,7 @@ export default function FileServer({
                 onChange={(e) => setRootFolder(e.target.value)}
                 placeholder="C:\path\to\shared_folder"
               />
-              <span className="text-[10px] text-slate-500 mt-1.5 block">실제 파일이 저장될 폴더의 절대 경로를 입력하세요. 존재하지 않으면 자동으로 생성됩니다.</span>
+              <span className="text-[10px] text-slate-500 mt-1.5 block">폴더의 절대 경로를 입력하세요. 없으면 자동 생성됩니다.</span>
             </div>
 
             <div className="grid grid-cols-2 gap-3">
@@ -123,7 +123,7 @@ export default function FileServer({
               type="submit"
               className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl font-bold tracking-wide transition shadow-lg shadow-indigo-950/50 cursor-pointer"
             >
-              포트 설정 변경 사항 저장
+              설정 저장
             </button>
           </form>
 
@@ -135,7 +135,7 @@ export default function FileServer({
                   <span className={`w-1.5 h-1.5 rounded-full ${config.tftpEnabled ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
                   TFTP Server Daemon
                 </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">대용량 펌웨어용 단순 전송 규격</div>
+                <div className="text-[10px] text-slate-400 mt-0.5">펌웨어 전송용 프로토콜</div>
               </div>
               <button
                 id="toggle-tftp-btn"
@@ -153,7 +153,7 @@ export default function FileServer({
                   <span className={`w-1.5 h-1.5 rounded-full ${config.ftpEnabled ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'}`}></span>
                   FTP Server Daemon
                 </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">ID/PW 인증형 안전 전송 규격</div>
+                <div className="text-[10px] text-slate-400 mt-0.5">인증 기반 파일 전송</div>
               </div>
               <button
                 id="toggle-ftp-btn"
@@ -174,9 +174,9 @@ export default function FileServer({
               <FolderOpen className="w-5 h-5 text-indigo-400" />
               <div>
                 <h3 className="text-sm font-display font-bold text-white">
-                  가상 공유 폴더 파일 브라우저 (Served Files)
+                  공유 폴더 파일 목록
                 </h3>
-                <p className="text-[11px] text-slate-400 mt-0.5">네트워크 클라이언트가 FTP/TFTP를 통해 접근할 수 있는 로컬 파일들</p>
+                <p className="text-[11px] text-slate-400 mt-0.5">FTP/TFTP로 접근 가능한 파일 목록</p>
               </div>
             </div>
             <button
@@ -192,7 +192,7 @@ export default function FileServer({
           {/* New file editor panel */}
           {showEditor && (
             <form onSubmit={handleCreateFile} className="p-4 bg-slate-950/80 border border-slate-850 rounded-xl space-y-3 text-xs" id="new-file-form">
-              <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">신규 환경 설정 텍스트 파일 (.cfg, .txt) 작성</span>
+              <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">설정 파일 작성 (.cfg, .txt)</span>
               <div className="grid grid-cols-3 gap-3 items-center">
                 <label className="text-slate-300 font-bold">파일 이름</label>
                 <input 
@@ -205,7 +205,7 @@ export default function FileServer({
                 />
               </div>
               <div className="space-y-1.5">
-                <label className="block text-slate-300 font-bold">파일 텍스트 본문 (CLI Commands or Notes)</label>
+                <label className="block text-slate-300 font-bold">파일 내용</label>
                 <textarea 
                   className="w-full h-24 bg-slate-900 border border-slate-800 rounded-lg p-2.5 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500"
                   placeholder="! Cisco commands go here..."
@@ -227,7 +227,7 @@ export default function FileServer({
                   type="submit" 
                   className="px-3 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg font-bold cursor-pointer transition"
                 >
-                  파일 쓰기 및 저장
+                  저장
                 </button>
               </div>
             </form>
@@ -238,7 +238,7 @@ export default function FileServer({
             <table className="w-full text-left text-xs">
               <thead className="bg-slate-900/80 border-b border-slate-850 text-slate-300 font-bold">
                 <tr>
-                  <th className="p-3">파일명 (File Name)</th>
+                  <th className="p-3">파일명</th>
                   <th className="p-3">용량 Size</th>
                   <th className="p-3">수정 날짜</th>
                   <th className="p-3 text-right">삭제</th>
@@ -260,7 +260,7 @@ export default function FileServer({
                         id={`delete-file-${file.name}`}
                         onClick={() => onDeleteFile(file.name)}
                         className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-rose-950/20 rounded-lg cursor-pointer transition"
-                        title="파일 영구 삭제"
+                        title="삭제"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -269,7 +269,7 @@ export default function FileServer({
                 ))}
                 {files.length === 0 && (
                   <tr>
-                    <td colSpan={4} className="text-center text-slate-500 py-12">현재 가상 서버 공유 폴더에 저장된 파일이 존재하지 않습니다.</td>
+                    <td colSpan={4} className="text-center text-slate-500 py-12">저장된 파일이 없습니다.</td>
                   </tr>
                 )}
               </tbody>
@@ -283,9 +283,9 @@ export default function FileServer({
         <div className="flex items-center justify-between border-b border-slate-855 pb-3">
           <div>
             <h3 className="text-sm font-display font-bold text-white">
-              FTP & TFTP 백업/배포 대용량 전송 로그 (File Transfer logs)
+              파일 전송 로그
             </h3>
-            <p className="text-[11px] text-slate-400 mt-0.5">네트워크 내의 스위치들이 FTP/TFTP 서버에 접속하여 펌웨어를 받거나 내보낸 전체 누적 내역</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">장비가 파일을 주고받은 전체 내역</p>
           </div>
           <button
             id="clear-transfers-btn"
@@ -293,7 +293,7 @@ export default function FileServer({
             className="text-slate-400 hover:text-rose-400 border border-slate-855 bg-slate-950 px-3 py-2 rounded-xl text-xs flex items-center gap-1.5 cursor-pointer transition"
           >
             <Trash2 className="w-3.5 h-3.5" />
-            전송 내역 완전 삭제
+            내역 삭제
           </button>
         </div>
 
@@ -305,9 +305,9 @@ export default function FileServer({
                 <th className="p-3">타입</th>
                 <th className="p-3">파일명</th>
                 <th className="p-3">파일 크기</th>
-                <th className="p-3">클라이언트 장비 IP</th>
+                <th className="p-3">장비 IP</th>
                 <th className="p-3">전송 속도</th>
-                <th className="p-3">날짜 및 시간</th>
+                <th className="p-3">일시</th>
                 <th className="p-3 text-right">전송 결과</th>
               </tr>
             </thead>
@@ -326,12 +326,12 @@ export default function FileServer({
                       {log.operation === 'UPLOAD' ? (
                         <>
                           <ArrowUpRight className="w-3.5 h-3.5 text-amber-400 shrink-0" />
-                          <span className="text-amber-400 font-bold">백업 수집 (Upload)</span>
+                          <span className="text-amber-400 font-bold">업로드</span>
                         </>
                       ) : (
                         <>
                           <ArrowDownLeft className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                          <span className="text-emerald-400 font-bold">펌웨어 배포 (Download)</span>
+                          <span className="text-emerald-400 font-bold">다운로드</span>
                         </>
                       )}
                     </span>
@@ -355,7 +355,7 @@ export default function FileServer({
               ))}
               {transferLogs.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="text-center text-slate-500 py-12">전송 로그 데이터베이스가 비어있습니다.</td>
+                  <td colSpan={8} className="text-center text-slate-500 py-12">전송 로그가 없습니다.</td>
                 </tr>
               )}
             </tbody>

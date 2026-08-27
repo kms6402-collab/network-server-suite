@@ -21,7 +21,7 @@ export default function SystemSettings({
   const [isRestarting, setIsRestarting] = useState(false);
 
   const handleRestartClick = () => {
-    if (!window.confirm("서비스를 재시작하시겠습니까? 잠시 접속이 끊길 수 있습니다.")) return;
+    if (!window.confirm("서비스를 재시작할까요? 잠시 접속이 끊깁니다.")) return;
     setIsRestarting(true);
     onRestartService();
     // The backend process is about to exit and relaunch, so there's nothing
@@ -39,21 +39,20 @@ export default function SystemSettings({
         <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-xl space-y-4">
           <h3 className="text-sm font-display font-semibold text-white border-b border-slate-850 pb-2 flex items-center gap-2">
             <ShieldCheck className="w-4 h-4 text-emerald-400" />
-            PC / 서버 재부팅 시 자동 가동 데몬 설정 (Service Autostart)
+            재부팅 시 자동 시작 설정
           </h3>
-          
+
           <div className="space-y-4 text-xs">
             <p className="text-slate-400 leading-relaxed">
-              서버 OS가 재시작되거나 정전 등의 이슈로 PC가 재부팅되었을 때, 별도의 수동 로그인 및 프로그램 실행 조작 없이 
-              <strong> DHCP, FTP, TFTP 가상 백엔드 네트워크 데몬</strong>이 시스템 백그라운드 서비스 수준에서 
-              자동으로 초기화 및 복구 가동되도록 지정하는 설정입니다.
+              재부팅 후 별도 조작 없이 <strong>DHCP, FTP, TFTP 서비스</strong>가
+              자동으로 다시 시작되도록 하는 설정입니다.
             </p>
 
             <div className="bg-slate-950/60 border border-slate-800 p-4 rounded-xl flex items-center justify-between">
               <div>
-                <div className="font-semibold text-white">자동 서비스 실행 활성화 (Autostart Status)</div>
+                <div className="font-semibold text-white">자동 시작 상태</div>
                 <div className="text-[10px] text-slate-400 mt-1">
-                  활성화 시, 본 컨테이너/OS 인프라가 올라올 때 마지막 가동 포트를 자동 바인딩합니다.
+                  활성화하면 시스템 시작 시 서비스가 자동으로 켜집니다.
                 </div>
               </div>
               <button
@@ -73,10 +72,10 @@ export default function SystemSettings({
             {/* Simulated Systemd startup configuration guide */}
             <div className="space-y-2 bg-slate-950 p-4 border border-slate-850 rounded-xl">
               <span className="font-mono text-[10px] font-bold text-indigo-400 block uppercase tracking-wider">
-                실제 Linux OS 배포용 systemd 데몬 등록 가이드
+                systemd 등록 가이드 (Linux)
               </span>
               <p className="text-[10px] text-slate-400 leading-relaxed">
-                해당 데몬은 Linux `/etc/systemd/system/network-suite.service` 로 영구 가입되어 관리할 수 있습니다.
+                `/etc/systemd/system/network-suite.service`에 등록해 관리할 수 있습니다.
               </p>
               <pre className="p-3 bg-slate-900 border border-slate-850 rounded text-[9px] font-mono overflow-x-auto text-slate-300 space-y-1">
                 <div>[Unit]</div>
@@ -99,19 +98,18 @@ export default function SystemSettings({
         <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-xl space-y-4">
           <h3 className="text-sm font-display font-semibold text-white border-b border-slate-850 pb-2 flex items-center gap-2">
             <Settings className="w-4 h-4 text-indigo-400" />
-            시스템 초기화 및 백엔드 복구 데이터베이스
+            시스템 초기화
           </h3>
 
           <div className="space-y-4 text-xs">
             <p className="text-slate-400 leading-relaxed">
-              설정 오작동 및 포트 충돌, 또는 잘못된 스위치 주소 예약 바인딩으로 인해 백엔드가 반응하지 않는 경우, 
-              저장 파일 데이터베이스를 지우고 최초 상태로 되돌립니다.
+              설정 오류나 포트 충돌로 응답이 없을 때, 저장된 데이터를 지우고 초기 상태로 되돌립니다.
             </p>
 
             <div className="p-4 bg-rose-950/15 border border-rose-900/30 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div className="space-y-0.5">
-                <span className="text-xs font-semibold text-rose-300 block">공장 초기화 (Factory Reset Database)</span>
-                <p className="text-[10px] text-slate-400">모든 DHCP 임대 상태, 스위치 터미널 계정, 쉘 자동화 스크립트가 리셋됩니다.</p>
+                <span className="text-xs font-semibold text-rose-300 block">공장 초기화</span>
+                <p className="text-[10px] text-slate-400">DHCP 임대, 터미널 계정, 스크립트가 모두 초기화됩니다.</p>
               </div>
               <button
                 id="factory-reset-btn"
@@ -126,7 +124,7 @@ export default function SystemSettings({
             <div className="p-4 bg-amber-950/15 border border-amber-900/30 rounded-xl flex flex-col md:flex-row md:items-center justify-between gap-3">
               <div className="space-y-0.5">
                 <span className="text-xs font-semibold text-amber-300 block">서비스 재시작 (Restart Service)</span>
-                <p className="text-[10px] text-slate-400">데이터는 유지한 채, 백엔드 프로세스만 종료 후 재기동합니다. 수초간 접속이 끊길 수 있습니다.</p>
+                <p className="text-[10px] text-slate-400">데이터는 유지한 채 프로세스만 재시작합니다. 잠시 접속이 끊깁니다.</p>
               </div>
               <button
                 id="restart-service-btn"
@@ -140,7 +138,7 @@ export default function SystemSettings({
             </div>
 
             <div className="space-y-3 p-4 bg-slate-950/40 border border-slate-850 rounded-xl">
-              <span className="font-semibold text-white block">시스템 가동 및 바인딩 자원 리소스</span>
+              <span className="font-semibold text-white block">사용 포트 정보</span>
               <div className="grid grid-cols-3 gap-3 text-center">
                 <div className="bg-slate-900/50 p-2.5 rounded border border-slate-850">
                   <div className="text-[10px] text-slate-400">DHCP 서버</div>
@@ -164,7 +162,7 @@ export default function SystemSettings({
       <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-xl space-y-4">
         <h3 className="text-sm font-display font-semibold text-white border-b border-slate-850 pb-2 flex items-center gap-2">
           <BookOpen className="w-4 h-4 text-indigo-400" />
-          네트워크 서버 스위트 운용 방법 지침 (User Manual)
+          이용 가이드 (User Manual)
         </h3>
 
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-xs text-slate-400">
@@ -174,30 +172,29 @@ export default function SystemSettings({
               1단계: DHCP 임대 개설
             </span>
             <p>
-              DHCP 서버 탭으로 이동하여 임대할 IP 대역폭(Start - End Range)과 게이트웨이 주소를 입력 후 활성화합니다. 
-              단말이 접수되면 자동으로 대여 목록에 등록되어 MAC 및 호스트 이름을 확인할 수 있습니다.
+              DHCP 탭에서 IP 범위와 게이트웨이를 입력 후 활성화하세요.
+              연결된 단말이 자동으로 목록에 등록됩니다.
             </p>
           </div>
 
           <div className="space-y-1.5 leading-relaxed">
             <span className="font-semibold text-white flex items-center gap-1">
               <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full"></span>
-              2단계: 파일 서버 및 백업 배치
+              2단계: 파일 서버 설정
             </span>
             <p>
-              FTP/TFTP 기능을 활성화하면, 임대 장치(L2/L3 스위치 등)가 원격 환경설정 파일이나 OS 바이너리를 업로드하거나 
-              안전하게 복사 배포받아 갈 수 있도록 가상 저장소가 자동 마운트됩니다.
+              FTP/TFTP를 켜면 장비가 설정 파일이나 펌웨어를 주고받을 수 있습니다.
             </p>
           </div>
 
           <div className="space-y-1.5 leading-relaxed">
             <span className="font-semibold text-white flex items-center gap-1">
               <span className="w-1.5 h-1.5 bg-emerald-400 rounded-full"></span>
-              3단계: SSH/Telnet 자동화 배포
+              3단계: SSH/Telnet 자동화
             </span>
             <p>
-              장치 프로필에 타겟 스위치의 계정을 등록하고, 일괄 실행할 스크립트 매크로를 작성합니다. 
-              일괄 배치 자동화(Batch Run)를 실행하면, 여러 장치에 동시 연결하여 설정 변경을 순식간에 적용합니다.
+              장비 계정과 실행할 스크립트를 등록하세요.
+              일괄 실행하면 여러 장비에 순서대로 설정을 적용합니다.
             </p>
           </div>
         </div>

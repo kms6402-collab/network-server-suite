@@ -94,7 +94,7 @@ export default function App() {
       setErrorMsg(null);
     } catch (error: any) {
       console.error(error);
-      setErrorMsg("오프라인 상태이거나 네트워크 백엔드 데몬이 아직 준비되지 않았습니다.");
+      setErrorMsg("서버에 연결할 수 없습니다.");
     } finally {
       setIsLoading(false);
     }
@@ -519,16 +519,22 @@ export default function App() {
     }
   };
 
-  const handleExecuteScript = async (hostId: string, scriptId: string) => {
+  // Returns the new execution's id so callers (e.g. the sequential batch
+  // runner in TerminalAutomation) can watch its status via the `executions`
+  // prop and know exactly when to move on to the next host.
+  const handleExecuteScript = async (hostId: string, scriptId: string): Promise<string | undefined> => {
     try {
-      await fetch('/api/scripts/execute', {
+      const res = await fetch('/api/scripts/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ hostId, scriptId })
       });
+      const data = await res.json().catch(() => ({}));
       fetchAllState();
+      return data.executionId as string | undefined;
     } catch (e) {
       console.error(e);
+      return undefined;
     }
   };
 
@@ -655,12 +661,12 @@ export default function App() {
   };
 
   const handleFactoryReset = async () => {
-    if (!confirm("정말 모든 장비 설정, 스크립트 템플릿, 그리고 대여 로그 이력을 초기화하시겠습니까?")) return;
+    if (!confirm("모든 설정과 기록을 초기화할까요?")) return;
     try {
       const res = await fetch('/api/system/reset', { method: 'POST' });
       if (res.ok) {
         fetchAllState();
-        alert("성공적으로 공장 초기화가 완료되었습니다.");
+        alert("초기화되었습니다.");
       }
     } catch (e) {
       console.error(e);
@@ -682,7 +688,7 @@ export default function App() {
       // Simulating reboot downtime
       setTimeout(() => {
         fetchAllState();
-        alert("가상 서버 재시작이 완료되었습니다. 백그라운드 자동 기동(Autostart) 스케줄러가 활성 서비스를 즉시 복구했습니다!");
+        alert("재시작이 완료되었습니다.");
       }, 1500);
     } catch (e) {
       console.error(e);
@@ -702,10 +708,10 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.1.2 Enterprise
+                v2.2.0 Enterprise
               </span>
             </h1>
-            <p className="text-xs text-slate-400 mt-1">통합 DHCP, TFTP, FTP 데몬 관리 및 CRT 자동화 텔넷/SSH 콘솔</p>
+            <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 CRT 자동화 콘솔</p>
           </div>
         </div>
 
@@ -768,7 +774,7 @@ export default function App() {
         {isLoading ? (
           <div className="py-24 text-center space-y-4">
             <RefreshCw className="w-8 h-8 text-indigo-400 animate-spin mx-auto" />
-            <p className="text-slate-400 text-sm">네트워크 백엔드 데몬 정보 수신 중...</p>
+            <p className="text-slate-400 text-sm">불러오는 중...</p>
           </div>
         ) : (
           <div className="transition-all duration-300">

@@ -23,7 +23,7 @@ interface TerminalAutomationProps {
   onAddScript: (name: string, description: string, commands: string[]) => void;
   onUpdateScript: (id: string, name: string, description: string, commands: string[]) => void;
   onRemoveScript: (id: string) => void;
-  onExecuteScript: (hostId: string, scriptId: string) => void;
+  onExecuteScript: (hostId: string, scriptId: string) => Promise<string | undefined>;
   onManualConnect: (hostId: string) => void;
   onSendManualCommand: (execIds: string[], command: string) => void;
   onDisconnectSession: (execId: string) => void;
@@ -106,6 +106,21 @@ export default function TerminalAutomation({
   // update/delete) has entries, this toggle lets the batch runner target all
   // of them at once instead of the single-host dropdown below.
   const [runOnAllSelectedHosts, setRunOnAllSelectedHosts] = useState(false);
+
+  // Sequential batch runner: executes the script on one host at a time,
+  // waiting for each execution to reach a terminal status (completed/failed)
+  // before starting the next — as opposed to firing every host at once.
+  // `currentExecId: null` means the next host's execute call is in flight
+  // (guards against the watcher effect re-triggering on a stale finished exec
+  // while we're still waiting for the new execution id to come back).
+  const [sequentialBatch, setSequentialBatch] = useState<{
+    scriptId: string;
+    queue: string[];
+    currentHostId: string;
+    currentExecId: string | null;
+    total: number;
+    doneCount: number;
+  } | null>(null);
 
   // Naming a new Batch Job: an in-app modal instead of window.prompt(), which
   // blocks the whole page's JS thread on a native browser dialog (froze the
@@ -314,7 +329,7 @@ export default function TerminalAutomation({
 
   const handleBulkDeleteClick = () => {
     if (selectedHostIds.size === 0) return;
-    if (!window.confirm(`선택한 ${selectedHostIds.size}개 장비를 일괄 삭제하시겠습니까?`)) return;
+    if (!window.confirm(`장비 ${selectedHostIds.size}개를 삭제할까요?`)) return;
     onBulkDeleteHosts(Array.from(selectedHostIds));
     setSelectedHostIds(new Set());
   };
@@ -368,18 +383,58 @@ export default function TerminalAutomation({
   // over from the single-host dropdown when the device list actually has a
   // non-empty multi-selection AND the toggle is switched on.
   const batchModeActive = runOnAllSelectedHosts && selectedHostIds.size > 0;
+  const sequentialBatchRunning = sequentialBatch !== null;
+
+  // Start (or advance to) one host in the sequential batch. `queue` is the
+  // hosts still waiting after this one. If the execute call itself fails to
+  // return an execution id (host/script deleted mid-batch, network error),
+  // skip straight to the next host instead of stalling forever waiting for a
+  // status update that will never arrive.
+  const runSequentialHost = (hostId: string, scriptId: string, queue: string[], doneCount: number, total: number) => {
+    setSequentialBatch({ scriptId, queue, currentHostId: hostId, currentExecId: null, total, doneCount });
+    onExecuteScript(hostId, scriptId).then(execId => {
+      setSequentialBatch(prev => {
+        // The batch was cancelled, or has already moved past this host.
+        if (!prev || prev.currentHostId !== hostId || prev.currentExecId !== null) return prev;
+        if (execId) return { ...prev, currentExecId: execId };
+        if (queue.length === 0) return null;
+        const [next, ...rest] = queue;
+        setTimeout(() => runSequentialHost(next, scriptId, rest, doneCount + 1, total), 0);
+        return prev;
+      });
+    });
+  };
+
+  // Kick off a sequential batch: start the first host, then let the watcher
+  // effect below chain through the rest as each one finishes.
+  const startSequentialBatch = (hostIds: string[], scriptId: string) => {
+    if (hostIds.length === 0) return;
+    const [first, ...rest] = hostIds;
+    runSequentialHost(first, scriptId, rest, 0, hostIds.length);
+  };
+
+  const cancelSequentialBatch = () => setSequentialBatch(null);
+
+  // Advance the sequential batch once the currently-running host's execution
+  // reaches a terminal status. Runs on every `executions` poll refresh.
+  useEffect(() => {
+    if (!sequentialBatch || !sequentialBatch.currentExecId) return;
+    const exec = executions.find(e => e.id === sequentialBatch.currentExecId);
+    if (!exec || exec.status === 'running' || exec.status === 'pending') return;
+
+    if (sequentialBatch.queue.length === 0) {
+      setSequentialBatch(null);
+      return;
+    }
+
+    const [next, ...rest] = sequentialBatch.queue;
+    runSequentialHost(next, sequentialBatch.scriptId, rest, sequentialBatch.doneCount + 1, sequentialBatch.total);
+  }, [executions, sequentialBatch]);
 
   const handleRunScript = () => {
-    if (!selectedScriptId) return;
+    if (!selectedScriptId || sequentialBatchRunning) return;
     if (batchModeActive) {
-      // Backend already supports independent per-host sessions/tabs, so this
-      // is a pure frontend fan-out: dispatch one execute call per selected
-      // host, staggered slightly so the requests don't all land in the same
-      // tick.
-      const targetHostIds: string[] = Array.from(selectedHostIds);
-      targetHostIds.forEach((hostId, idx) => {
-        setTimeout(() => onExecuteScript(hostId, selectedScriptId), idx * 200);
-      });
+      startSequentialBatch(Array.from(selectedHostIds), selectedScriptId);
       return;
     }
     if (!selectedHostId) return;
@@ -405,22 +460,24 @@ export default function TerminalAutomation({
   };
 
   // Re-run a saved batch job: filter out hosts/scripts that may have been
-  // removed since the job was saved, then fan out onExecuteScript calls the
-  // same staggered way handleRunScript does for the live multi-select.
+  // removed since the job was saved, then run the same sequential (one host
+  // at a time) batch as handleRunScript does for the live multi-select.
   const handleRunSavedBatchJob = (job: BatchJob) => {
+    if (sequentialBatchRunning) {
+      setBatchJobError('이미 실행 중인 배치가 있습니다. 완료 후 다시 시도하세요.');
+      return;
+    }
     if (!scripts.some(s => s.id === job.scriptId)) {
-      setBatchJobError(`"${job.name}" 배치 작업이 참조하는 스크립트가 더 이상 존재하지 않습니다.`);
+      setBatchJobError(`"${job.name}"의 스크립트가 삭제되었습니다.`);
       return;
     }
     const targetHostIds = job.hostIds.filter(id => hosts.some(h => h.id === id));
     if (targetHostIds.length === 0) {
-      setBatchJobError(`"${job.name}" 배치 작업에 포함된 장비가 더 이상 존재하지 않습니다.`);
+      setBatchJobError(`"${job.name}"의 장비가 삭제되었습니다.`);
       return;
     }
     setBatchJobError(null);
-    targetHostIds.forEach((hostId, idx) => {
-      setTimeout(() => onExecuteScript(hostId, job.scriptId), idx * 200);
-    });
+    startSequentialBatch(targetHostIds, job.scriptId);
   };
 
   const handleSendManualCommand = (e: React.FormEvent) => {
@@ -520,7 +577,7 @@ export default function TerminalAutomation({
           {showDhcpImportPanel ? (
             <form onSubmit={handleDhcpImportSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[340px]" id="dhcp-import-form">
               <span className="text-[11px] font-bold text-emerald-400 uppercase tracking-wider block">
-                DHCP 임대 클라이언트 선택 후 일괄 등록
+                DHCP 임대에서 가져오기
               </span>
 
               <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold">
@@ -551,11 +608,11 @@ export default function TerminalAutomation({
                   </label>
                 ))}
                 {importableLeases.length === 0 && (
-                  <div className="text-slate-500 text-center py-4 text-[10px]">가져올 수 있는 DHCP 임대 클라이언트가 없습니다.</div>
+                  <div className="text-slate-500 text-center py-4 text-[10px]">가져올 DHCP 클라이언트가 없습니다.</div>
                 )}
               </div>
 
-              <span className="text-[10px] text-slate-400">선택한 장비들에 공통으로 적용할 접속 계정 정보:</span>
+              <span className="text-[10px] text-slate-400">공통 접속 계정 정보:</span>
               <div className="grid grid-cols-3 gap-2">
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">프로토콜</label>
@@ -629,9 +686,9 @@ export default function TerminalAutomation({
           ) : showBulkUpdateForm ? (
             <form onSubmit={handleBulkUpdateSubmit} className="space-y-2.5 bg-slate-950 p-4 border border-slate-850 rounded-xl text-xs overflow-y-auto max-h-[340px]" id="bulk-update-host-form">
               <span className="text-[11px] font-bold text-indigo-400 uppercase tracking-wider block">
-                선택 장비 {selectedHostIds.size}개 계정 정보 일괄 수정
+                선택 장비 {selectedHostIds.size}개 계정 수정
               </span>
-              <p className="text-[10px] text-slate-500">비워두면 해당 항목은 변경하지 않습니다.</p>
+              <p className="text-[10px] text-slate-500">비워두면 유지됩니다.</p>
 
               <div className="grid grid-cols-3 gap-2">
                 <div>
@@ -893,7 +950,7 @@ export default function TerminalAutomation({
                 </div>
               ))}
               {hosts.length === 0 && (
-                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 SSH/Telnet 장비가 존재하지 않습니다.</div>
+                <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 장비가 없습니다.</div>
               )}
               </div>
             </div>
@@ -1015,10 +1072,10 @@ export default function TerminalAutomation({
           <div className="space-y-3">
             <h3 className="text-sm font-display font-bold text-white border-b border-slate-855 pb-2.5 flex items-center gap-1.5">
               <ShieldCheck className="w-4 h-4 text-indigo-400 animate-pulse" />
-              원격 CRT 자동화 일괄 배치 실행기
+              배치 자동화 실행
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              저장된 SSH/Telnet 프로필과 자동화 명령 스크립트를 선택한 뒤 <strong>배치 실행</strong> 버튼을 누르면, 백엔드 세션 스레드가 생성되어 원격 타겟 장비에 순차적으로 자동화 배포 명령을 밀어넣고 로그를 기록합니다.
+              장치와 스크립트를 선택하고 실행하세요. 여러 장치 선택 시 하나씩 순서대로 실행됩니다.
             </p>
 
             <div className="space-y-2.5 pt-2">
@@ -1029,20 +1086,37 @@ export default function TerminalAutomation({
                     id="run-on-all-selected-hosts-toggle"
                     checked={runOnAllSelectedHosts}
                     onChange={(e) => setRunOnAllSelectedHosts(e.target.checked)}
+                    disabled={sequentialBatchRunning}
                     className="accent-indigo-500 cursor-pointer"
                   />
                   <CheckSquare className="w-3 h-3" />
-                  선택된 {selectedHostIds.size}개 장비 전체에 일괄 실행
+                  선택 장비 {selectedHostIds.size}개 순차 실행
                 </label>
               )}
 
-              <div className={batchModeActive ? "opacity-40 pointer-events-none transition" : "transition"}>
-                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">대상 네트워크 스위치/라우터 선택</label>
+              {sequentialBatch && (
+                <div className="flex items-center justify-between gap-2 text-[11px] font-bold text-emerald-300 bg-emerald-950/20 border border-emerald-900/40 rounded-lg px-2.5 py-1.5">
+                  <span className="truncate">
+                    순차 실행 중 {sequentialBatch.doneCount + 1}/{sequentialBatch.total} · {hosts.find(h => h.id === sequentialBatch.currentHostId)?.name || sequentialBatch.currentHostId}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={cancelSequentialBatch}
+                    className="text-slate-400 hover:text-rose-400 cursor-pointer shrink-0"
+                    title="남은 순서 취소"
+                  >
+                    취소
+                  </button>
+                </div>
+              )}
+
+              <div className={(batchModeActive || sequentialBatchRunning) ? "opacity-40 pointer-events-none transition" : "transition"}>
+                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">대상 장치 선택</label>
                 <select
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white text-xs focus:outline-none focus:border-indigo-500 transition"
                   value={selectedHostId}
                   onChange={(e) => setSelectedHostId(e.target.value)}
-                  disabled={batchModeActive}
+                  disabled={batchModeActive || sequentialBatchRunning}
                 >
                   <option value="" disabled>장치를 선택하세요</option>
                   {hosts.map(h => (
@@ -1051,14 +1125,15 @@ export default function TerminalAutomation({
                 </select>
               </div>
 
-              <div>
-                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">자동 배포 스크립트 선택</label>
+              <div className={sequentialBatchRunning ? "opacity-40 pointer-events-none transition" : "transition"}>
+                <label className="block text-[11px] text-slate-300 font-bold mb-1.5">실행 스크립트 선택</label>
                 <select
                   className="w-full bg-slate-950 border border-slate-800 rounded-xl p-2.5 text-white text-xs focus:outline-none focus:border-indigo-500 transition"
                   value={selectedScriptId}
                   onChange={(e) => setSelectedScriptId(e.target.value)}
+                  disabled={sequentialBatchRunning}
                 >
-                  <option value="" disabled>스크립트 템플릿 선택</option>
+                  <option value="" disabled>스크립트 선택</option>
                   {scripts.map(s => (
                     <option key={s.id} value={s.id}>{s.name} ({s.commands.length} lines)</option>
                   ))}
@@ -1070,23 +1145,26 @@ export default function TerminalAutomation({
           <button
             id="run-automation-btn"
             onClick={handleRunScript}
-            disabled={!selectedScriptId || (!batchModeActive && !selectedHostId)}
+            disabled={!selectedScriptId || (!batchModeActive && !selectedHostId) || sequentialBatchRunning}
             className="w-full py-3 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:pointer-events-none active:bg-emerald-700 text-white rounded-xl font-bold tracking-wider text-xs flex items-center justify-center gap-2 cursor-pointer transition duration-150 shadow-lg shadow-emerald-950/20"
           >
             <Play className="w-4 h-4 text-emerald-100" />
-            {batchModeActive
-              ? `선택된 ${selectedHostIds.size}개 장비에 일괄 배치 실행 (RUN BATCH)`
-              : '배치 자동화 CLI 배포 실행 (RUN BATCH)'}
+            {sequentialBatchRunning
+              ? '실행 중...'
+              : batchModeActive
+              ? `선택 장비 ${selectedHostIds.size}개 순차 실행`
+              : '스크립트 실행'}
           </button>
 
           {selectedHostIds.size > 0 && selectedScriptId && (
             <button
               id="save-batch-job-btn"
               onClick={handleSaveCurrentAsBatchJob}
-              className="w-full py-2 bg-slate-850 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-xl font-bold tracking-wider text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition duration-150"
+              disabled={sequentialBatchRunning}
+              className="w-full py-2 bg-slate-850 hover:bg-slate-800 border border-slate-800 text-slate-200 rounded-xl font-bold tracking-wider text-[11px] flex items-center justify-center gap-1.5 cursor-pointer transition duration-150 disabled:opacity-30 disabled:pointer-events-none"
             >
               <Save className="w-3.5 h-3.5 text-indigo-300" />
-              이 조합을 배치 작업으로 저장 ({selectedHostIds.size}개 장비)
+              배치 작업으로 저장 ({selectedHostIds.size}개)
             </button>
           )}
         </div>
@@ -1096,7 +1174,7 @@ export default function TerminalAutomation({
       <div className="p-5 glass-card rounded-2xl space-y-3">
         <h3 className="text-sm font-display font-bold text-white border-b border-slate-855 pb-2.5 flex items-center gap-1.5">
           <Bookmark className="w-4 h-4 text-indigo-400" />
-          저장된 배치 작업 (Saved Batch Jobs)
+          저장된 배치 작업
         </h3>
         {batchJobError && (
           <div className="p-2.5 rounded-lg border border-rose-900/50 bg-rose-950/30 text-rose-300 text-xs flex items-center justify-between gap-2">
@@ -1115,24 +1193,25 @@ export default function TerminalAutomation({
                   <div>
                     <div className="text-sm font-bold text-white truncate">{job.name}</div>
                     <div className="text-[11px] text-slate-400 mt-1 space-y-0.5">
-                      <div>대상 장비: {job.hostIds.length}개</div>
-                      <div className="truncate">스크립트: {jobScript ? jobScript.name : '(삭제된 스크립트)'}</div>
+                      <div>장비 {job.hostIds.length}개</div>
+                      <div className="truncate">스크립트: {jobScript ? jobScript.name : '(삭제됨)'}</div>
                     </div>
                   </div>
                   <div className="flex items-center gap-2">
                     <button
                       onClick={() => handleRunSavedBatchJob(job)}
-                      className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 cursor-pointer transition"
+                      disabled={sequentialBatchRunning}
+                      className="flex-1 py-1.5 bg-emerald-600 hover:bg-emerald-500 active:bg-emerald-700 text-white rounded-lg font-bold text-[11px] flex items-center justify-center gap-1 cursor-pointer transition disabled:opacity-30 disabled:pointer-events-none"
                     >
                       <Play className="w-3 h-3" />
                       실행
                     </button>
                     <button
                       onClick={() => {
-                        if (window.confirm(`배치 작업 "${job.name}"을(를) 삭제하시겠습니까?`)) onDeleteBatchJob(job.id);
+                        if (window.confirm(`"${job.name}"을(를) 삭제할까요?`)) onDeleteBatchJob(job.id);
                       }}
                       className="p-1.5 text-slate-400 hover:text-rose-400 rounded-lg hover:bg-rose-950/20 cursor-pointer transition"
-                      title="배치 작업 삭제"
+                      title="삭제"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                     </button>
@@ -1149,9 +1228,9 @@ export default function TerminalAutomation({
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-855 pb-3">
           <div className="shrink-0 max-w-full sm:max-w-[45%]">
             <h3 className="text-sm font-display font-bold text-white">
-              실시간 원격 CLI 세션 뷰어 (SecureCRT Interactive Terminal Emulator)
+              실시간 CLI 세션
             </h3>
-            <p className="text-[11px] text-slate-400 mt-0.5">동시에 구동 중인 여러 장비의 CLI 원격 세션 상태와 진행 상세 로그</p>
+            <p className="text-[11px] text-slate-400 mt-0.5">세션 상태와 로그</p>
           </div>
 
           {/* Active session tabs selection */}
@@ -1277,7 +1356,7 @@ export default function TerminalAutomation({
               {activeExec.status === 'running' && (
                 <div className="flex items-center gap-2 text-amber-300 text-xs py-2 animate-pulse">
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>원격 장비가 CLI 응답 패킷을 연산 중입니다... ({activeExec.currentCommand})</span>
+                  <span>명령 실행 중... ({activeExec.currentCommand})</span>
                 </div>
               )}
             </div>
@@ -1293,7 +1372,7 @@ export default function TerminalAutomation({
                   className="accent-indigo-500 cursor-pointer"
                 />
                 <Radio className="w-3 h-3 text-indigo-400" />
-                모든 활성 세션에 동시 전송 (Broadcast to all sessions{openSessionCount > 0 ? ` · ${openSessionCount}개 연결됨` : ''})
+                모든 세션에 동시 전송{openSessionCount > 0 ? ` (${openSessionCount}개 연결됨)` : ''}
               </label>
               <form onSubmit={handleSendManualCommand} className="flex gap-2" id="manual-cli-form">
                 <div className="flex-1 bg-slate-950 border border-slate-850 rounded-xl flex items-center px-3 gap-2">
@@ -1303,8 +1382,8 @@ export default function TerminalAutomation({
                     className="w-full bg-transparent border-0 text-white font-mono text-xs focus:outline-none py-2.5 disabled:opacity-40"
                     placeholder={
                       activeExec.sessionOpen
-                        ? "대화식 수동 명령을 장비에 직접 송출합니다... (e.g., show run-config, ping 8.8.8.8)"
-                        : "세션이 종료되어 수동 명령을 보낼 수 없습니다. 장비 목록에서 다시 접속하세요."
+                        ? "명령 입력 (예: show run-config, ping 8.8.8.8)"
+                        : "세션 종료됨 - 장비 목록에서 다시 접속하세요."
                     }
                     value={manualCommand}
                     onChange={(e) => setManualCommand(e.target.value)}
@@ -1324,7 +1403,7 @@ export default function TerminalAutomation({
               {!activeExec.sessionOpen && (
                 <div className="flex items-center gap-1.5 text-[10px] text-slate-500">
                   <AlertCircle className="w-3 h-3" />
-                  이 세션의 연결이 종료되어 더 이상 명령을 보낼 수 없습니다.
+                  연결이 종료되어 명령을 보낼 수 없습니다.
                 </div>
               )}
             </div>
@@ -1333,8 +1412,8 @@ export default function TerminalAutomation({
           <div className="bg-slate-950/40 border border-slate-850/80 rounded-2xl py-16 text-center text-slate-500 text-xs font-mono flex flex-col items-center justify-center gap-3">
             <Terminal className="w-8 h-8 text-slate-600 animate-pulse" />
             <div className="leading-relaxed">
-              활성 또는 과거 터미널 세션이 선택되지 않았습니다.<br/>
-              상단 실행기에서 배치 스크립트를 작동시키거나, 장비 목록의 "수동 접속" 버튼으로 세션을 개설하십시오.
+              선택된 세션이 없습니다.<br/>
+              위에서 스크립트를 실행하거나 장비 목록의 "수동 접속"을 누르세요.
             </div>
           </div>
         )}
@@ -1355,7 +1434,7 @@ export default function TerminalAutomation({
                 배치 작업으로 저장
               </h3>
               <p className="text-[11px] text-slate-400">
-                선택된 {selectedHostIds.size}개 장비 + 스크립트 조합에 이름을 붙여 저장합니다. 다음부터는 이 이름으로 한 번에 다시 실행할 수 있습니다.
+                장비 {selectedHostIds.size}개 + 스크립트 조합을 이름 붙여 저장합니다.
               </p>
               <input
                 type="text"
