@@ -38,6 +38,15 @@ export interface TftpFtpConfig {
   ftpPort: number;
 }
 
+// A whitelisted FTP login. The FTP server rejects any USER/PASS not matching
+// one of these exactly — if this list is empty, no one can log in (no
+// anonymous/open-access fallback).
+export interface FtpCredential {
+  id: string;
+  username: string;
+  password: string;
+}
+
 export interface FileRecord {
   name: string;
   size: number;

@@ -1,17 +1,20 @@
 import React, { useState } from 'react';
 import {
   FolderOpen, FileCode, Trash2, ArrowUpRight, ArrowDownLeft,
-  Settings, Server, Power, RefreshCw, Plus, Search
+  Settings, Server, Power, RefreshCw, Plus, Search, KeyRound
 } from 'lucide-react';
-import { TftpFtpConfig, FileRecord, TransferLog } from '../types';
+import { TftpFtpConfig, FileRecord, TransferLog, FtpCredential } from '../types';
 
 interface FileServerProps {
   config: TftpFtpConfig;
   files: FileRecord[];
   transferLogs: TransferLog[];
+  credentials: FtpCredential[];
   onToggleService: (service: 'TFTP' | 'FTP', enabled: boolean) => void;
   onUpdateConfig: (rootFolder: string, tftpPort: number, ftpPort: number) => void;
   onBrowseFolder: () => Promise<string | null>;
+  onAddCredential: (username: string, password: string) => void;
+  onDeleteCredential: (id: string) => void;
   onDeleteFile: (name: string) => void;
   onCreateFile: (name: string, content: string) => void;
   onClearTransfers: () => void;
@@ -21,9 +24,12 @@ export default function FileServer({
   config,
   files,
   transferLogs,
+  credentials,
   onToggleService,
   onUpdateConfig,
   onBrowseFolder,
+  onAddCredential,
+  onDeleteCredential,
   onDeleteFile,
   onCreateFile,
   onClearTransfers
@@ -40,9 +46,21 @@ export default function FileServer({
   const [newFileContent, setNewFileContent] = useState("");
   const [showEditor, setShowEditor] = useState(false);
 
+  // FTP credential whitelist form
+  const [credUsername, setCredUsername] = useState("");
+  const [credPassword, setCredPassword] = useState("");
+
   const handleUpdateConfig = (e: React.FormEvent) => {
     e.preventDefault();
     onUpdateConfig(rootFolder, Number(tftpPort), Number(ftpPort));
+  };
+
+  const handleAddCredential = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!credUsername || !credPassword) return;
+    onAddCredential(credUsername, credPassword);
+    setCredUsername("");
+    setCredPassword("");
   };
 
   const handleCreateFile = (e: React.FormEvent) => {
@@ -175,6 +193,11 @@ export default function FileServer({
                 {config.ftpEnabled ? 'Deactivate' : 'Activate'}
               </button>
             </div>
+            {credentials.length === 0 && (
+              <p className="text-[10px] text-amber-400/90 leading-relaxed">
+                등록된 FTP 계정이 없습니다. 아래에서 계정을 추가하기 전까지는 아무도 FTP에 접속할 수 없습니다.
+              </p>
+            )}
           </div>
         </div>
 
@@ -286,6 +309,85 @@ export default function FileServer({
               </tbody>
             </table>
           </div>
+        </div>
+      </div>
+
+      {/* FTP whitelist accounts */}
+      <div className="p-5 glass-card rounded-2xl space-y-3">
+        <div>
+          <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
+            <KeyRound className="w-4 h-4 text-indigo-400" />
+            FTP 계정
+          </h3>
+          <p className="text-[11px] text-slate-400 mt-0.5">등록된 아이디/비밀번호로만 FTP 접속을 허용합니다.</p>
+        </div>
+
+        <form onSubmit={handleAddCredential} className="grid grid-cols-1 sm:grid-cols-3 gap-3 bg-slate-950/40 border border-slate-850/60 p-3 rounded-xl text-xs" id="add-ftp-credential-form">
+          <div>
+            <label className="block text-slate-400 font-bold mb-1 text-[10px]">아이디</label>
+            <input
+              type="text"
+              className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
+              placeholder="admin"
+              value={credUsername}
+              onChange={(e) => setCredUsername(e.target.value)}
+              required
+            />
+          </div>
+          <div>
+            <label className="block text-slate-400 font-bold mb-1 text-[10px]">비밀번호</label>
+            <input
+              type="password"
+              className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
+              placeholder="••••••••"
+              value={credPassword}
+              onChange={(e) => setCredPassword(e.target.value)}
+              required
+            />
+          </div>
+          <div className="flex items-end">
+            <button
+              id="add-ftp-credential-submit"
+              type="submit"
+              className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition shadow h-[34px] flex items-center justify-center gap-1 cursor-pointer text-xs"
+            >
+              <Plus className="w-3.5 h-3.5" />
+              계정 추가
+            </button>
+          </div>
+        </form>
+
+        <div className="border border-slate-850/60 rounded-xl bg-slate-950/40 overflow-y-auto max-h-[220px]">
+          <table className="w-full text-left text-xs">
+            <thead className="bg-slate-900/60 text-slate-300 border-b border-slate-850/60 font-bold text-[10px]">
+              <tr>
+                <th className="p-2.5 pl-3">아이디</th>
+                <th className="p-2.5 text-right pr-3">관리</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-850/30 text-slate-300 text-[11px]">
+              {credentials.map((cred) => (
+                <tr key={cred.id} className="hover:bg-slate-900/10 transition">
+                  <td className="p-2.5 pl-3 font-bold text-white font-mono">{cred.username}</td>
+                  <td className="p-2.5 text-right pr-3">
+                    <button
+                      id={`delete-ftp-credential-${cred.id}`}
+                      onClick={() => onDeleteCredential(cred.id)}
+                      className="text-slate-400 hover:text-rose-400 p-1 rounded transition cursor-pointer"
+                      title="계정 삭제"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+              {credentials.length === 0 && (
+                <tr>
+                  <td colSpan={2} className="text-center text-slate-500 py-6">등록된 계정이 없습니다.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
         </div>
       </div>
 

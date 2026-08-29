@@ -2,9 +2,9 @@ import React, { useState, useEffect } from 'react';
 import { 
   Activity, Server, Network, FolderOpen, Terminal, Settings, RefreshCw, AlertCircle
 } from 'lucide-react';
-import { 
-  SystemStatus, DhcpConfig, DhcpLease, DhcpReservation, 
-  TftpFtpConfig, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution, BatchJob
+import {
+  SystemStatus, DhcpConfig, DhcpLease, DhcpReservation,
+  TftpFtpConfig, FtpCredential, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution, BatchJob
 } from './types';
 
 // Import sub-components
@@ -51,6 +51,7 @@ export default function App() {
     ftpPort: 21
   });
 
+  const [ftpCredentials, setFtpCredentials] = useState<FtpCredential[]>([]);
   const [files, setFiles] = useState<FileRecord[]>([]);
   const [transferLogs, setTransferLogs] = useState<TransferLog[]>([]);
   const [terminalHosts, setTerminalHosts] = useState<TerminalHost[]>([]);
@@ -71,6 +72,7 @@ export default function App() {
       setLeases(data.leases);
       setReservations(data.reservations);
       setTftpFtpConfig(data.tftpFtpConfig);
+      setFtpCredentials(data.ftpCredentials);
       setTransferLogs(data.transferLogs);
       setTerminalHosts(data.terminalHosts);
       setCommandScripts(data.commandScripts);
@@ -299,6 +301,38 @@ export default function App() {
     } catch (e) {
       console.error(e);
       return null;
+    }
+  };
+
+  const handleAddFtpCredential = async (username: string, password: string) => {
+    try {
+      const res = await fetch('/api/tftpftp/credentials', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setFtpCredentials(data.ftpCredentials);
+        setErrorMsg(null);
+      } else {
+        setErrorMsg(data.error || "계정을 추가하지 못했습니다.");
+      }
+    } catch (e) {
+      console.error(e);
+      setErrorMsg("계정을 추가하는 중 오류가 발생했습니다.");
+    }
+  };
+
+  const handleDeleteFtpCredential = async (id: string) => {
+    try {
+      const res = await fetch(`/api/tftpftp/credentials/${id}`, { method: 'DELETE' });
+      if (res.ok) {
+        const data = await res.json();
+        setFtpCredentials(data.ftpCredentials);
+      }
+    } catch (e) {
+      console.error(e);
     }
   };
 
@@ -692,7 +726,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.3.0 Enterprise
+                v2.4.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -803,9 +837,12 @@ export default function App() {
                 config={tftpFtpConfig}
                 files={files}
                 transferLogs={transferLogs}
+                credentials={ftpCredentials}
                 onToggleService={handleToggleService}
                 onUpdateConfig={handleUpdateFileConfig}
                 onBrowseFolder={handleBrowseFolder}
+                onAddCredential={handleAddFtpCredential}
+                onDeleteCredential={handleDeleteFtpCredential}
                 onDeleteFile={handleDeleteFile}
                 onCreateFile={handleCreateFile}
                 onClearTransfers={handleClearTransfers}

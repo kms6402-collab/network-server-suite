@@ -14,8 +14,9 @@ import {
   DhcpConfig,
   DhcpLease, 
   DhcpReservation, 
-  TftpFtpConfig, 
-  TransferLog, 
+  TftpFtpConfig,
+  FtpCredential,
+  TransferLog,
   TerminalHost, 
   CommandScript,
   ScriptExecution,
@@ -114,6 +115,10 @@ let tftpFtpConfig: TftpFtpConfig = {
   ftpPort: 21
 };
 
+// Whitelisted FTP logins (see the real FTP server section below) — empty by
+// default, meaning FTP rejects every login until at least one is added.
+let ftpCredentials: FtpCredential[] = [];
+
 let transferLogs: TransferLog[] = [];
 let terminalHosts: TerminalHost[] = [];
 let commandScripts: CommandScript[] = [];
@@ -181,6 +186,7 @@ function loadState() {
       if (data.leases) leases = data.leases;
       if (data.reservations) reservations = data.reservations;
       if (data.tftpFtpConfig) tftpFtpConfig = { ...tftpFtpConfig, ...data.tftpFtpConfig };
+      if (data.ftpCredentials) ftpCredentials = data.ftpCredentials;
       if (data.transferLogs) transferLogs = data.transferLogs;
       if (data.terminalHosts) terminalHosts = data.terminalHosts;
       if (data.commandScripts) commandScripts = data.commandScripts;
@@ -240,6 +246,7 @@ function loadState() {
         if (sections.TerminalHosts?.data) terminalHosts = JSON.parse(sections.TerminalHosts.data);
         if (sections.CommandScripts?.data) commandScripts = JSON.parse(sections.CommandScripts.data);
         if (sections.BatchJobs?.data) batchJobs = JSON.parse(sections.BatchJobs.data);
+        if (sections.FtpCredentials?.data) ftpCredentials = JSON.parse(sections.FtpCredentials.data);
 
         console.log("State restored from setting.ini fallback (applet_state.json not found).");
 
@@ -286,6 +293,7 @@ function saveState() {
       leases,
       reservations,
       tftpFtpConfig,
+      ftpCredentials,
       transferLogs,
       terminalHosts,
       commandScripts,
@@ -330,7 +338,8 @@ function saveState() {
       Reservations: { data: JSON.stringify(reservations) },
       TerminalHosts: { data: JSON.stringify(terminalHosts) },
       CommandScripts: { data: JSON.stringify(commandScripts) },
-      BatchJobs: { data: JSON.stringify(batchJobs) }
+      BatchJobs: { data: JSON.stringify(batchJobs) },
+      FtpCredentials: { data: JSON.stringify(ftpCredentials) }
     };
     fs.writeFileSync(SETTINGS_FILE, stringifyIni(iniSections), "utf-8");
   } catch (iniError) {
@@ -889,6 +898,7 @@ app.get("/api/status", (req, res) => {
     leases,
     reservations,
     tftpFtpConfig,
+    ftpCredentials,
     transferLogs,
     terminalHosts,
     commandScripts,
@@ -2063,11 +2073,14 @@ function startFtpServer(): Promise<{ success: boolean; error?: string }> {
     log: createSilentFtpLogger()
   } as any);
 
-  // This app has no per-user credential store, so any non-empty username is
-  // accepted (an open, LAN-facing file drop — the same trust model as the
-  // TFTP server above, which has no authentication concept at all).
-  server.on('login', ({ connection, username }: any, resolveLogin: any, rejectLogin: any) => {
-    if (!username) { rejectLogin(new Error("사용자 이름이 필요합니다.")); return; }
+  // Whitelist-only: the username+password must exactly match one of
+  // ftpCredentials. An empty list means nobody can log in — there is no
+  // anonymous/open-access fallback (TFTP, by contrast, still has no
+  // authentication concept at all; that's a protocol-level limitation, not a
+  // choice, since RFC 1350 has no login step).
+  server.on('login', ({ connection, username, password }: any, resolveLogin: any, rejectLogin: any) => {
+    const match = ftpCredentials.find(c => c.username === username && c.password === password);
+    if (!match) { rejectLogin(new Error("아이디 또는 비밀번호가 올바르지 않습니다.")); return; }
 
     connection.on('STOR', (err: Error | null, filePath: string) => {
       if (err) { logDhcp('WARN', `FTP 업로드 실패: ${err.message}`); return; }
@@ -2229,12 +2242,42 @@ if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.
   res.json({ success: true, path: output });
 });
 
+// Whitelisted FTP login CRUD. The FTP server (below) checks every USER/PASS
+// against this list — there's no anonymous fallback, so at least one entry
+// must exist before FTP is usable.
+app.post("/api/tftpftp/credentials", (req, res) => {
+  const { username, password } = req.body;
+  if (typeof username !== "string" || !username.trim() || typeof password !== "string" || !password) {
+    return res.status(400).json({ error: "아이디와 비밀번호를 모두 입력해야 합니다." });
+  }
+  const trimmedUsername = username.trim();
+  if (ftpCredentials.some(c => c.username === trimmedUsername)) {
+    return res.status(400).json({ error: "이미 등록된 아이디입니다." });
+  }
+  ftpCredentials.push({ id: "ftpcred-" + Date.now(), username: trimmedUsername, password });
+  saveState();
+  res.json({ success: true, ftpCredentials });
+});
+
+app.delete("/api/tftpftp/credentials/:id", (req, res) => {
+  ftpCredentials = ftpCredentials.filter(c => c.id !== req.params.id);
+  saveState();
+  res.json({ success: true, ftpCredentials });
+});
+
 // Resolves a user-supplied file name against the current served-folder root,
 // rejecting any path that would escape outside of it (e.g. via "../").
 function resolveServedPath(baseDir: string, name: string): string | null {
   const resolvedBase = path.resolve(baseDir);
   const resolvedPath = path.resolve(resolvedBase, name);
-  if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(resolvedBase + path.sep)) {
+  // path.resolve() of a drive root (e.g. "D:\") already ends with a
+  // separator, so blindly appending another one (as this used to do)
+  // produced "D:\\" and every file directly under that root would then fail
+  // resolvedPath.startsWith(...) — rejecting every read/write as an "escape"
+  // even though nothing escaped anything. Only append the separator when the
+  // base doesn't already end with one.
+  const baseWithSep = resolvedBase.endsWith(path.sep) ? resolvedBase : resolvedBase + path.sep;
+  if (resolvedPath !== resolvedBase && !resolvedPath.startsWith(baseWithSep)) {
     return null;
   }
   return resolvedPath;
@@ -2244,15 +2287,22 @@ function resolveServedPath(baseDir: string, name: string): string | null {
 app.get("/api/files", (req, res) => {
   const baseDir = tftpFtpConfig.rootFolder;
   try {
-    const files = fs.readdirSync(baseDir).map(fileName => {
+    const files = fs.readdirSync(baseDir).flatMap(fileName => {
       const filePath = path.join(baseDir, fileName);
-      const stat = fs.statSync(filePath);
-      return {
-        name: fileName,
-        size: stat.size,
-        isDirectory: stat.isDirectory(),
-        modifiedTime: stat.mtime.toISOString()
-      };
+      try {
+        const stat = fs.statSync(filePath);
+        return [{
+          name: fileName,
+          size: stat.size,
+          isDirectory: stat.isDirectory(),
+          modifiedTime: stat.mtime.toISOString()
+        }];
+      } catch {
+        // Sharing a drive root exposes OS-protected entries (e.g. "System
+        // Volume Information", "$RECYCLE.BIN") that even an administrator
+        // can't stat() — skip them instead of failing the whole listing.
+        return [];
+      }
     });
     res.json({ files });
   } catch (error: any) {
@@ -3293,6 +3343,7 @@ app.post("/api/system/reset", async (req, res) => {
     tftpPort: 69,
     ftpPort: 21
   };
+  ftpCredentials = [];
   transferLogs = [];
   terminalHosts = [];
   commandScripts = [];
