@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
-import { 
-  FolderOpen, FileCode, Trash2, ArrowUpRight, ArrowDownLeft, 
-  Settings, Server, Power, RefreshCw, Plus, Download, Upload, Clock, HardDrive
+import {
+  FolderOpen, FileCode, Trash2, ArrowUpRight, ArrowDownLeft,
+  Settings, Server, Power, RefreshCw, Plus, Search
 } from 'lucide-react';
 import { TftpFtpConfig, FileRecord, TransferLog } from '../types';
 
@@ -11,8 +11,7 @@ interface FileServerProps {
   transferLogs: TransferLog[];
   onToggleService: (service: 'TFTP' | 'FTP', enabled: boolean) => void;
   onUpdateConfig: (rootFolder: string, tftpPort: number, ftpPort: number) => void;
-  onUploadSimulatedFile: (name: string, size: number, type: 'TFTP' | 'FTP') => void;
-  onDownloadSimulatedFile: (name: string, type: 'TFTP' | 'FTP') => void;
+  onBrowseFolder: () => Promise<string | null>;
   onDeleteFile: (name: string) => void;
   onCreateFile: (name: string, content: string) => void;
   onClearTransfers: () => void;
@@ -24,27 +23,22 @@ export default function FileServer({
   transferLogs,
   onToggleService,
   onUpdateConfig,
-  onUploadSimulatedFile,
-  onDownloadSimulatedFile,
+  onBrowseFolder,
   onDeleteFile,
   onCreateFile,
   onClearTransfers
 }: FileServerProps) {
-  
+
   // Local state
   const [rootFolder, setRootFolder] = useState(config.rootFolder);
   const [tftpPort, setTftpPort] = useState(config.tftpPort);
   const [ftpPort, setFtpPort] = useState(config.ftpPort);
-  
+  const [isBrowsing, setIsBrowsing] = useState(false);
+
   // File editor form
   const [newFileName, setNewFileName] = useState("");
   const [newFileContent, setNewFileContent] = useState("");
   const [showEditor, setShowEditor] = useState(false);
-
-  // Simulated upload choice
-  const [simUploadName, setSimUploadName] = useState("cisco_ios_15_4_vlan.bin");
-  const [simUploadSize, setSimUploadSize] = useState("85"); // in MB
-  const [simUploadProto, setSimUploadProto] = useState<'TFTP' | 'FTP'>("TFTP");
 
   const handleUpdateConfig = (e: React.FormEvent) => {
     e.preventDefault();
@@ -60,9 +54,14 @@ export default function FileServer({
     setShowEditor(false);
   };
 
-  const triggerUploadSimulation = () => {
-    const sizeInBytes = Number(simUploadSize) * 1024 * 1024;
-    onUploadSimulatedFile(simUploadName, sizeInBytes, simUploadProto);
+  const handleBrowseClick = async () => {
+    setIsBrowsing(true);
+    try {
+      const picked = await onBrowseFolder();
+      if (picked) setRootFolder(picked);
+    } finally {
+      setIsBrowsing(false);
+    }
   };
 
   const getFormatSize = (bytes: number) => {
@@ -87,14 +86,26 @@ export default function FileServer({
           <form onSubmit={handleUpdateConfig} className="space-y-4 text-xs" id="tftp-config-form">
             <div>
               <label className="block text-slate-300 font-bold mb-1.5">공유 폴더 경로</label>
-              <input
-                type="text"
-                className="w-full bg-slate-950 border border-slate-850 rounded-xl p-2.5 text-white font-mono text-xs focus:outline-none focus:border-indigo-500/80 focus:ring-1 focus:ring-indigo-500/40 transition"
-                value={rootFolder}
-                onChange={(e) => setRootFolder(e.target.value)}
-                placeholder="C:\path\to\shared_folder"
-              />
-              <span className="text-[10px] text-slate-500 mt-1.5 block">절대 경로를 입력하세요. 없으면 자동 생성됩니다.</span>
+              <div className="flex gap-1.5">
+                <input
+                  type="text"
+                  className="w-full bg-slate-950 border border-slate-850 rounded-xl p-2.5 text-white font-mono text-xs focus:outline-none focus:border-indigo-500/80 focus:ring-1 focus:ring-indigo-500/40 transition"
+                  value={rootFolder}
+                  onChange={(e) => setRootFolder(e.target.value)}
+                  placeholder="C:\path\to\shared_folder"
+                />
+                <button
+                  id="browse-folder-btn"
+                  type="button"
+                  onClick={handleBrowseClick}
+                  disabled={isBrowsing}
+                  className="shrink-0 px-3 bg-slate-850 hover:bg-slate-800 disabled:opacity-50 disabled:pointer-events-none border border-slate-800 text-slate-200 rounded-xl font-bold flex items-center gap-1.5 cursor-pointer transition"
+                >
+                  <Search className="w-3.5 h-3.5" />
+                  {isBrowsing ? '선택 중...' : '찾아보기'}
+                </button>
+              </div>
+              <span className="text-[10px] text-slate-500 mt-1.5 block">절대 경로를 입력하거나 찾아보기로 선택하세요. 없으면 자동 생성됩니다.</span>
             </div>
 
             <div className="grid grid-cols-2 gap-3">

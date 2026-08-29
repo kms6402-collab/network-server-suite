@@ -286,36 +286,19 @@ export default function App() {
     }
   };
 
-  const handleUploadSimulatedFile = async (name: string, size: number, type: 'TFTP' | 'FTP') => {
+  // Opens a native folder-picker on the server machine (PowerShell
+  // FolderBrowserDialog) and returns the chosen absolute path, or null if the
+  // dialog failed or was cancelled. Only fills in the field — the caller
+  // still has to submit the config form to actually apply/validate it.
+  const handleBrowseFolder = async (): Promise<string | null> => {
     try {
-      const res = await fetch('/api/files/upload-simulated', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, size, type })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setTransferLogs(data.transferLogs);
-        fetchAllState();
-      }
+      const res = await fetch('/api/tftpftp/browse-folder', { method: 'POST' });
+      const data = await res.json();
+      if (res.ok && data.success && !data.cancelled) return data.path;
+      return null;
     } catch (e) {
       console.error(e);
-    }
-  };
-
-  const handleDownloadSimulatedFile = async (name: string, type: 'TFTP' | 'FTP') => {
-    try {
-      const res = await fetch('/api/files/download-simulated', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, type })
-      });
-      if (res.ok) {
-        const data = await res.json();
-        setTransferLogs(data.transferLogs);
-      }
-    } catch (e) {
-      console.error(e);
+      return null;
     }
   };
 
@@ -709,7 +692,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.2.0 Enterprise
+                v2.3.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -756,7 +739,7 @@ export default function App() {
               className={`px-3.5 py-2 rounded-lg flex items-center gap-2 transition-all duration-200 cursor-pointer ${activeTab === 'terminal' ? 'bg-indigo-600 shadow-lg shadow-indigo-950/50 text-white font-semibold' : 'text-slate-400 hover:text-white hover:bg-slate-900/50'}`}
             >
               <Terminal className="w-3.5 h-3.5" />
-              CRT 자동화
+              CLI 자동화
             </button>
             <button
               id="tab-btn-settings"
@@ -822,8 +805,7 @@ export default function App() {
                 transferLogs={transferLogs}
                 onToggleService={handleToggleService}
                 onUpdateConfig={handleUpdateFileConfig}
-                onUploadSimulatedFile={handleUploadSimulatedFile}
-                onDownloadSimulatedFile={handleDownloadSimulatedFile}
+                onBrowseFolder={handleBrowseFolder}
                 onDeleteFile={handleDeleteFile}
                 onCreateFile={handleCreateFile}
                 onClearTransfers={handleClearTransfers}

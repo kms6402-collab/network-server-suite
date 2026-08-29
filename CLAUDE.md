@@ -83,11 +83,17 @@ npm run clean         # dist, server.js, applet_state.json, served_folder 삭제
   - `DELETE /api/dhcp/leases/:id` — 개별 리스 삭제(반환). `leases` 배열뿐 아니라 DHCP 서버 내부 임대 추적 구조에서도 함께 제거해서 그 IP가 즉시 재할당 가능한 상태가 된다. `host-pc-self`는 삭제 대상에서 제외.
   - `scanArpTable()`/`discoverNetworkDevices()`(ARP 캐시 기반 보조 탐지)는 그대로 남아있고, 진짜 서버가 이미 발급한 리스(같은 MAC)는 덮어쓰지 않도록 되어 있다 — 정적 IP를 쓰는 기기 등 진짜 서버가 못 잡는 기기를 보조적으로 보여주는 용도.
 
-#### TFTP/FTP 공유 폴더
+#### TFTP/FTP (실제 프로토콜 서버, 진짜 DHCP 서버와 동일한 방향성)
 
-- `tftpFtpConfig.rootFolder`는 이제 실제로 편집 가능하다. `/api/tftpftp/config`가 경로를 `path.resolve()`로 정규화하고, 존재하지 않으면 생성(`fs.mkdirSync(recursive)`), 디렉터리인지(`fs.statSync().isDirectory()`), 쓰기 권한이 있는지(`fs.accessSync(W_OK)`)를 검증한 뒤에만 저장한다.
+- `tftpFtpConfig.rootFolder`는 실제로 편집 가능하다. `/api/tftpftp/config`가 경로를 `path.resolve()`로 정규화하고, 존재하지 않으면 생성(`fs.mkdirSync(recursive)`), 디렉터리인지(`fs.statSync().isDirectory()`), 쓰기 권한이 있는지(`fs.accessSync(W_OK)`)를 검증한 뒤에만 저장한다. `FileServer.tsx`에는 이 값을 직접 타이핑하는 대신 PowerShell `FolderBrowserDialog`를 여는 "찾아보기" 버튼(`POST /api/tftpftp/browse-folder`)이 있다 — 서버가 로컬 데스크톱 앱이라 "서버 머신"이 곧 브라우저를 여는 그 머신이라는 전제로 동작하며, 버튼은 입력창을 채우기만 하고 실제 적용은 여전히 "설정 저장" 버튼(`/api/tftpftp/config`)이 담당한다.
 - 파일 관련 라우트(`/api/files` 등)는 하드코딩된 `SERVED_FOLDER` 상수 대신 **요청마다** `tftpFtpConfig.rootFolder`를 다시 읽어서 기준 디렉터리로 사용한다(모듈 로드 시점에 캐싱하지 않음). `SERVED_FOLDER` 상수는 최초 기본값과 `/api/system/reset` 초기화용으로만 남아 있다.
 - `resolveServedPath(baseDir, name)` 헬퍼가 사용자가 지정한 파일명이 `baseDir` 바깥으로 벗어나지 않는지(`../` 경로 탈출 방지) 검증하며, 벗어나면 400을 반환한다.
+- **`/api/tftpftp/toggle`가 켜졌을 때 실제로 UDP 69(TFTP)/TCP 21(FTP) 포트를 열어 진짜 파일 전송을 처리한다** — 예전에는 상태 플래그만 뒤집고 `/api/files/upload-simulated`·`/api/files/download-simulated`가 가짜 문자열을 파일에 써넣는 시뮬레이션이었으나(두 라우트 모두 제거됨), 이제 원격 장비(또는 실제 `tftp`/`ftp` 클라이언트, `curl ftp://...`)가 붙어 진짜로 파일을 주고받는다.
+  - **TFTP**는 DHCP처럼 마땅한 유지보수 중인 npm 서버 패키지가 없어서 `dgram` 위에 RFC 1350을 직접 구현했다(`startTftpServer`/`stopTftpServer`, RRQ/WRQ/DATA/ACK/ERROR). 소켓 하나를 `0.0.0.0:tftpPort`에 바인딩하고 `(클라이언트 IP, 클라이언트 포트)` 튜플로 세션(`tftpSessions: Map`)을 구분한다 — 표준 구현처럼 전송마다 새 포트로 갈아타지는 않지만 RFC상 문제없고, 다수 클라이언트가 동시에 붙어도 튜플 단위로 안전하게 분리된다. 옵션 협상(OACK, blksize 등)은 구현하지 않고 항상 512바이트 블록의 기본 프로토콜만 지원한다 — 옵션을 요청하는 클라이언트가 있어도 그냥 무시하고 base 프로토콜로 응답하면 대부분의 클라이언트가 자동으로 폴백한다.
+  - **FTP**는 순수 JS 유지보수 패키지 `ftp-srv`를 사용한다(DHCP/TFTP와 달리 이 경우는 검증된 라이브러리가 있어서 직접 구현하지 않았다). 계정 체계가 없는 앱이므로 **아이디만 있으면(빈 문자열만 아니면) 무조건 로그인 허용** — 사내망 전용 파일 드롭 용도라는 전제. PASV 데이터 채널 IP는 `resolveFtpPasvAddress()`가 접속한 클라이언트와 같은 서브넷의 로컬 어댑터 IP를 찾아 돌려주고(루프백 접속이면 127.0.0.1), PASV 포트 범위는 50000-50099로 제한했다. `ftp-srv`는 `new FtpSrv(...)`를 호출할 때마다 `process`에 SIGTERM/SIGINT/SIGQUIT 리스너를 추가하고 `close()`해도 제거하지 않는 라이브러리 자체 버릇이 있어서, `process.setMaxListeners()`를 올려 반복 토글 시 `MaxListenersExceededWarning`이 뜨지 않게 해뒀다. 기본 bunyan 로거는 콘솔에 매우 시끄러워서 무음 로거(`createSilentFtpLogger`)로 교체했다.
+  - 전송 완료/실패는 `transferLogs`에 실시간으로 기록된다(`logTransferStart`/`finalizeTransferLog`). **`saveState()`는 전송 시작·종료 시점에만 호출된다** — TFTP는 블록(512바이트)마다 ACK/DATA가 오가므로 매 블록마다 저장하면 `saveState()`의 동기 전체 파일 쓰기 때문에 큰 파일 전송이 극도로 느려진다. FTP는 `ftp-srv`의 `STOR`/`RETR` 커넥션 이벤트가 전송 "완료 후"에만 발생해 시작 시각을 알 수 없으므로 전송 속도는 `-`로 표기하고, TFTP는 시작 시각을 알고 있어 실제 MB/s를 계산한다.
+  - 프로세스가 부팅될 때(`startServer()`) `systemStatus.tftpRunning`/`ftpRunning`이 복원된 상태로 true면 실제로 `startTftpServer()`/`startFtpServer()`를 호출해 진짜로 재기동한다. **DHCP는 의도적으로 제외** — DHCP는 다른 네트워크와 충돌할 실제 위험이 있어 재부팅마다 자동으로 다시 붙는 대신 사용자가 매번 토글로 재확인하도록 남겨뒀다(프론트의 `window.confirm` 경고와 짝을 이루는 설계).
+  - `/api/system/reset`(공장 초기화)도 상태 플래그만 초기화하는 게 아니라 `stopDhcpServer()`/`stopTftpServer()`/`stopFtpServer()`를 실제로 호출해 진짜 서버까지 내린다 — 안 그러면 화면은 "꺼짐"인데 뒤에서는 계속 떠 있는 상태가 된다.
 
 #### 터미널 자동화 (실제 SSH/Telnet, 연결 유지 + 수동 CLI + 동시 세션 브로드캐스트)
 
@@ -133,7 +139,7 @@ npm run clean         # dist, server.js, applet_state.json, served_folder 삭제
 
 참고로 유지보수되는 포크인 `@yao-pkg/pkg`도 시도해봤으나: (a) CLI에 `--icon` 옵션 자체가 없고, (b) 그쪽의 `pkg-fetch`가 기대하는 base 바이너리 패치 버전이 vercel/pkg의 것과 달라 두 툴체인을 섞어 쓰면(`@yao-pkg/pkg` + vercel `pkg-fetch`가 받아온 바이너리) `ERR_INVALID_ARG_TYPE ... promisify` 같은 prelude 부트스트랩 오류로 크래시한다. 아이콘 문제는 결국 **원래 쓰던 `pkg@5.8.1` 툴체인 내부에서, 위 `built-*` 캐시 트릭으로** 해결해야 한다.
 
-**참고(Tip)**: `ssh2`/`telnet-client` 추가 이후 `build:exe`(pkg 패키징)까지 실제로 재빌드해서 검증 완료했다. 이 프로젝트의 `ssh2`는 선택적 네이티브 애드온(`cpu-features`)이 설치되어 있지 않아 순수 JS 폴백으로 동작하며, `telnet-client`도 네이티브 `.node` 바이너리가 없다 — 그래서 pkg의 가상 파일시스템과 충돌 없이 정상 패키징됐다. 다만 `npm install`을 다시 하거나 의존성 버전이 바뀌어 `cpu-features`(네이티브 애드온)가 실제로 설치되는 상황이 생기면, pkg가 네이티브 `.node` 바이너리를 제대로 못 담을 수 있으니 그때는 `node_modules/cpu-features`가 존재하는지부터 확인할 것.
+**참고(Tip)**: `ssh2`/`telnet-client` 추가 이후 `build:exe`(pkg 패키징)까지 실제로 재빌드해서 검증 완료했다. 이 프로젝트의 `ssh2`는 선택적 네이티브 애드온(`cpu-features`)이 설치되어 있지 않아 순수 JS 폴백으로 동작하며, `telnet-client`도 네이티브 `.node` 바이너리가 없다 — 그래서 pkg의 가상 파일시스템과 충돌 없이 정상 패키징됐다. 다만 `npm install`을 다시 하거나 의존성 버전이 바뀌어 `cpu-features`(네이티브 애드온)가 실제로 설치되는 상황이 생기면, pkg가 네이티브 `.node` 바이너리를 제대로 못 담을 수 있으니 그때는 `node_modules/cpu-features`가 존재하는지부터 확인할 것. `ftp-srv`(및 그 의존성인 `bunyan`의 선택적 네이티브 애드온 `dtrace-provider`)도 마찬가지로 `.node` 바이너리 없이 순수 JS 폴백으로 패키징되는 것을 확인했다 — `node_modules/dtrace-provider`에 `.node` 파일이 없으면 안전하다.
 
 ### `assets/icon.ico`
 

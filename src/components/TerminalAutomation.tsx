@@ -423,10 +423,24 @@ export default function TerminalAutomation({
   // non-empty multi-selection AND the toggle is switched on.
   const batchModeActive = runOnAllSelectedHosts && selectedHostIds.size > 0;
 
+  // Numeric (not lexicographic) ascending compare, so 192.168.0.2 sorts
+  // before 192.168.0.10. Non-numeric/malformed octets fall back to 0 rather
+  // than throwing, so a host with a blank/invalid IP just sorts first.
+  const compareHostsByIp = (a: TerminalHost, b: TerminalHost) => {
+    const toOctets = (ip: string) => ip.split('.').map(n => parseInt(n, 10) || 0);
+    const [oa, ob] = [toOctets(a.ip), toOctets(b.ip)];
+    for (let i = 0; i < 4; i++) {
+      if ((oa[i] || 0) !== (ob[i] || 0)) return (oa[i] || 0) - (ob[i] || 0);
+    }
+    return 0;
+  };
+  const sortedHosts = [...hosts].sort(compareHostsByIp);
+
   const handleRunScript = () => {
     if (!selectedScriptId) return;
     if (batchModeActive) {
-      runBatchSequential(Array.from(selectedHostIds), selectedScriptId);
+      const orderedIds = sortedHosts.filter(h => selectedHostIds.has(h.id)).map(h => h.id);
+      runBatchSequential(orderedIds, selectedScriptId);
       return;
     }
     if (!selectedHostId) return;
@@ -459,7 +473,7 @@ export default function TerminalAutomation({
       setBatchJobError(`"${job.name}" 스크립트가 삭제되었습니다.`);
       return;
     }
-    const targetHostIds = job.hostIds.filter(id => hosts.some(h => h.id === id));
+    const targetHostIds = sortedHosts.filter(h => job.hostIds.includes(h.id)).map(h => h.id);
     if (targetHostIds.length === 0) {
       setBatchJobError(`"${job.name}" 장비가 삭제되었습니다.`);
       return;
@@ -847,6 +861,11 @@ export default function TerminalAutomation({
           ) : (
             <div className="flex-1 flex flex-col min-h-0 space-y-2">
               {hosts.length > 0 && (
+                <p className="text-[10px] text-slate-500 shrink-0">
+                  장비를 체크하면 오른쪽 배치 실행기에서 여러 대에 스크립트를 순차 실행할 수 있습니다.
+                </p>
+              )}
+              {hosts.length > 0 && (
                 <div className="flex items-center justify-between gap-2 text-[10px] shrink-0">
                   <label className="flex items-center gap-1.5 text-slate-400 font-bold cursor-pointer select-none">
                     <input
@@ -887,7 +906,7 @@ export default function TerminalAutomation({
                 </div>
               )}
               <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-              {hosts.map((host) => (
+              {sortedHosts.map((host) => (
                 <div key={host.id} className={`p-3 bg-slate-950/40 border rounded-xl flex items-center justify-between hover:border-slate-700/80 hover:bg-slate-950/60 transition ${selectedHostIds.has(host.id) ? 'border-indigo-700/70 bg-indigo-950/10' : 'border-slate-850'}`}>
                   <div className="flex items-center gap-2.5 min-w-0">
                     <input
@@ -994,11 +1013,14 @@ export default function TerminalAutomation({
                 <label className="block text-slate-300 font-bold mb-1">실행 CLI 명령목록 (줄바꿈 구분)</label>
                 <textarea
                   className="w-full h-20 bg-slate-900 border border-slate-800 rounded-lg p-2 text-white font-mono text-[10px] focus:outline-none focus:border-indigo-500"
-                  placeholder="enable&#10;configure terminal&#10;interface GigabitEthernet1/1&#10;no shutdown"
+                  placeholder="enable&#10;configure terminal&#10;<s1>interface GigabitEthernet1/1&#10;no shutdown"
                   value={scriptCommands}
                   onChange={(e) => setScriptCommands(e.target.value)}
                   required
                 ></textarea>
+                <span className="text-[10px] text-slate-500 mt-1 block">
+                  줄 맨 앞에 <code className="text-indigo-300">&lt;s1&gt;</code> 처럼 붙이면 그 명령을 보내기 전 1초 대기 (소수점 가능, 예: <code className="text-indigo-300">&lt;s2.5&gt;</code> = 2.5초). 태그가 없으면 기본 1.2초 간격으로 전송됩니다.
+                </span>
               </div>
 
               <div className="flex justify-end gap-2 text-[10px] pt-1">
@@ -1090,7 +1112,7 @@ export default function TerminalAutomation({
                   disabled={batchModeActive}
                 >
                   <option value="" disabled>장치를 선택하세요</option>
-                  {hosts.map(h => (
+                  {sortedHosts.map(h => (
                     <option key={h.id} value={h.id}>{h.name} ({h.ip})</option>
                   ))}
                 </select>

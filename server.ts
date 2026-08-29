@@ -9,6 +9,7 @@ import { fileURLToPath } from "url";
 import { createServer as createViteServer } from "vite";
 import { Client as SshClient } from "ssh2";
 import { Telnet } from "telnet-client";
+import { FtpSrv } from "ftp-srv";
 import {
   DhcpConfig,
   DhcpLease, 
@@ -1636,18 +1637,516 @@ app.post("/api/dhcp/leases/:id/renew", async (req, res) => {
 });
 
 
+// --- Real TFTP server (RFC 1350, hand-rolled over dgram — same rationale as
+// the DHCP engine above: no well-maintained npm TFTP server package exists,
+// and the protocol itself is simple enough to implement directly) ---
+
+function describeServiceBindError(serviceLabel: string, port: number, err: NodeJS.ErrnoException): string {
+  if (err.code === "EACCES") {
+    return `${serviceLabel} 서버 포트(${port}) 바인딩 실패 — 관리자 권한으로 실행하거나 다른 프로그램과의 포트 충돌을 확인하세요. (권한 부족: EACCES)`;
+  }
+  if (err.code === "EADDRINUSE") {
+    return `${serviceLabel} 서버 포트(${port}) 바인딩 실패 — 이미 다른 프로그램이 포트 ${port}을 사용 중입니다. (EADDRINUSE)`;
+  }
+  return `${serviceLabel} 서버 포트(${port}) 바인딩 실패: ${err.message}`;
+}
+
+// Starts a transfer log entry ('IN_PROGRESS') and finalizes it later
+// ('COMPLETED'/'FAILED'). saveState() is only called at these two points
+// (never per-packet) — a TFTP transfer can involve thousands of 512-byte
+// blocks, and saveState() does a full synchronous file write, so calling it
+// per-block would make transfers unusably slow.
+function logTransferStart(service: 'TFTP' | 'FTP', operation: 'UPLOAD' | 'DOWNLOAD', clientIp: string, fileName: string, fileSize: number): TransferLog {
+  const entry: TransferLog = {
+    id: "transfer-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7),
+    service,
+    clientIp: clientIp.replace(/^::ffff:/, ""),
+    operation,
+    fileName,
+    fileSize,
+    progress: 0,
+    speed: '',
+    status: 'IN_PROGRESS',
+    timestamp: new Date().toISOString()
+  };
+  transferLogs.push(entry);
+  saveState();
+  return entry;
+}
+
+function finalizeTransferLog(entry: TransferLog, success: boolean, finalBytes: number, elapsedMs?: number) {
+  entry.status = success ? 'COMPLETED' : 'FAILED';
+  entry.fileSize = finalBytes;
+  if (success) entry.progress = 100;
+  if (elapsedMs && elapsedMs > 0) {
+    const seconds = Math.max(elapsedMs / 1000, 0.05);
+    entry.speed = `${((finalBytes / (1024 * 1024)) / seconds).toFixed(1)} MB/s`;
+  } else {
+    entry.speed = '-';
+  }
+  saveState();
+}
+
+const TFTP_OPCODE = { RRQ: 1, WRQ: 2, DATA: 3, ACK: 4, ERROR: 5 };
+const TFTP_BLOCK_SIZE = 512;
+const TFTP_TIMEOUT_MS = 3000;
+const TFTP_MAX_RETRIES = 5;
+
+interface TftpSession {
+  mode: 'read' | 'write';
+  clientAddress: string;
+  clientPort: number;
+  fh: fs.promises.FileHandle;
+  filePath: string;
+  blockNum: number; // last block fully ACKed (read) / written (write)
+  pendingBlock: number; // block number of the in-flight packet awaiting a response
+  lastPacket: Buffer;
+  isFinalBlock: boolean; // read sessions only: whether pendingBlock is the last one
+  transferredBytes: number;
+  logEntry: TransferLog;
+  startedAt: number;
+  retries: number;
+  timer: NodeJS.Timeout | null;
+}
+
+let tftpSocket: dgram.Socket | null = null;
+const tftpSessions = new Map<string, TftpSession>();
+
+function buildTftpDataPacket(block: number, data: Buffer): Buffer {
+  const header = Buffer.alloc(4);
+  header.writeUInt16BE(TFTP_OPCODE.DATA, 0);
+  header.writeUInt16BE(block & 0xffff, 2);
+  return Buffer.concat([header, data]);
+}
+
+function buildTftpAckPacket(block: number): Buffer {
+  const packet = Buffer.alloc(4);
+  packet.writeUInt16BE(TFTP_OPCODE.ACK, 0);
+  packet.writeUInt16BE(block & 0xffff, 2);
+  return packet;
+}
+
+function buildTftpErrorPacket(code: number, message: string): Buffer {
+  const msgBuf = Buffer.from(message, "ascii");
+  const packet = Buffer.alloc(4 + msgBuf.length + 1);
+  packet.writeUInt16BE(TFTP_OPCODE.ERROR, 0);
+  packet.writeUInt16BE(code, 2);
+  msgBuf.copy(packet, 4);
+  packet[4 + msgBuf.length] = 0;
+  return packet;
+}
+
+function parseTftpRequest(msg: Buffer): { filename: string; mode: string } | null {
+  const nullIdx1 = msg.indexOf(0, 2);
+  if (nullIdx1 === -1) return null;
+  const filename = msg.toString("ascii", 2, nullIdx1);
+  const nullIdx2 = msg.indexOf(0, nullIdx1 + 1);
+  if (nullIdx2 === -1) return null;
+  const mode = msg.toString("ascii", nullIdx1 + 1, nullIdx2).toLowerCase();
+  if (!filename) return null;
+  return { filename, mode };
+}
+
+function sendTftpError(socket: dgram.Socket, address: string, port: number, code: number, message: string) {
+  socket.send(buildTftpErrorPacket(code, message), port, address, () => { /* best effort */ });
+}
+
+function tftpSessionKey(address: string, port: number): string {
+  return `${address}:${port}`;
+}
+
+function clearTftpTimer(session: TftpSession) {
+  if (session.timer) {
+    clearTimeout(session.timer);
+    session.timer = null;
+  }
+}
+
+function cleanupTftpSession(key: string, success: boolean) {
+  const session = tftpSessions.get(key);
+  if (!session) return;
+  clearTftpTimer(session);
+  tftpSessions.delete(key);
+  session.fh.close().catch(() => { /* already closed */ });
+  if (session.logEntry.status === 'IN_PROGRESS') {
+    finalizeTransferLog(session.logEntry, success, session.transferredBytes, Date.now() - session.startedAt);
+  }
+}
+
+function armTftpTimer(socket: dgram.Socket, key: string) {
+  const session = tftpSessions.get(key);
+  if (!session) return;
+  clearTftpTimer(session);
+  session.timer = setTimeout(() => {
+    const s = tftpSessions.get(key);
+    if (!s) return;
+    s.retries++;
+    if (s.retries > TFTP_MAX_RETRIES) {
+      cleanupTftpSession(key, false);
+      return;
+    }
+    socket.send(s.lastPacket, s.clientPort, s.clientAddress, () => { /* best effort */ });
+    armTftpTimer(socket, key);
+  }, TFTP_TIMEOUT_MS);
+}
+
+async function sendNextTftpDataBlock(socket: dgram.Socket, key: string) {
+  const session = tftpSessions.get(key);
+  if (!session) return;
+  const nextBlock = session.blockNum + 1;
+  const buf = Buffer.alloc(TFTP_BLOCK_SIZE);
+  const { bytesRead } = await session.fh.read(buf, 0, TFTP_BLOCK_SIZE, (nextBlock - 1) * TFTP_BLOCK_SIZE);
+  const data = buf.subarray(0, bytesRead);
+  const packet = buildTftpDataPacket(nextBlock, data);
+  session.pendingBlock = nextBlock;
+  session.isFinalBlock = bytesRead < TFTP_BLOCK_SIZE;
+  session.lastPacket = packet;
+  session.retries = 0;
+  socket.send(packet, session.clientPort, session.clientAddress, () => { /* best effort */ });
+  armTftpTimer(socket, key);
+}
+
+async function handleTftpRrq(socket: dgram.Socket, rinfo: dgram.RemoteInfo, filename: string) {
+  const key = tftpSessionKey(rinfo.address, rinfo.port);
+  const filePath = resolveServedPath(tftpFtpConfig.rootFolder, filename);
+  if (!filePath) { sendTftpError(socket, rinfo.address, rinfo.port, 2, "Access violation"); return; }
+
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(filePath);
+    if (stat.isDirectory()) throw new Error("is a directory");
+  } catch {
+    sendTftpError(socket, rinfo.address, rinfo.port, 1, "File not found");
+    return;
+  }
+
+  let fh: fs.promises.FileHandle;
+  try {
+    fh = await fs.promises.open(filePath, "r");
+  } catch (error: any) {
+    sendTftpError(socket, rinfo.address, rinfo.port, 2, `Access violation: ${error.message}`);
+    return;
+  }
+
+  const logEntry = logTransferStart('TFTP', 'DOWNLOAD', rinfo.address, path.basename(filename), stat.size);
+  tftpSessions.set(key, {
+    mode: 'read',
+    clientAddress: rinfo.address,
+    clientPort: rinfo.port,
+    fh,
+    filePath,
+    blockNum: 0,
+    pendingBlock: 0,
+    lastPacket: Buffer.alloc(0),
+    isFinalBlock: false,
+    transferredBytes: 0,
+    logEntry,
+    startedAt: Date.now(),
+    retries: 0,
+    timer: null
+  });
+  await sendNextTftpDataBlock(socket, key);
+}
+
+async function handleTftpWrq(socket: dgram.Socket, rinfo: dgram.RemoteInfo, filename: string) {
+  const key = tftpSessionKey(rinfo.address, rinfo.port);
+  const filePath = resolveServedPath(tftpFtpConfig.rootFolder, filename);
+  if (!filePath) { sendTftpError(socket, rinfo.address, rinfo.port, 2, "Access violation"); return; }
+
+  let fh: fs.promises.FileHandle;
+  try {
+    fh = await fs.promises.open(filePath, "w");
+  } catch (error: any) {
+    sendTftpError(socket, rinfo.address, rinfo.port, 2, `Access violation: ${error.message}`);
+    return;
+  }
+
+  const logEntry = logTransferStart('TFTP', 'UPLOAD', rinfo.address, path.basename(filename), 0);
+  const ackPacket = buildTftpAckPacket(0);
+  tftpSessions.set(key, {
+    mode: 'write',
+    clientAddress: rinfo.address,
+    clientPort: rinfo.port,
+    fh,
+    filePath,
+    blockNum: 0,
+    pendingBlock: 0,
+    lastPacket: ackPacket,
+    isFinalBlock: false,
+    transferredBytes: 0,
+    logEntry,
+    startedAt: Date.now(),
+    retries: 0,
+    timer: null
+  });
+  socket.send(ackPacket, rinfo.port, rinfo.address, () => { /* best effort */ });
+  armTftpTimer(socket, key);
+}
+
+async function handleTftpAck(socket: dgram.Socket, key: string, block: number) {
+  const session = tftpSessions.get(key);
+  if (!session || session.mode !== 'read') return;
+  if (block !== session.pendingBlock) return; // stale/duplicate ACK, ignore
+
+  clearTftpTimer(session);
+  session.blockNum = block;
+  session.transferredBytes += session.lastPacket.length - 4; // exclude the 4-byte DATA header
+  if (session.isFinalBlock) {
+    cleanupTftpSession(key, true);
+    return;
+  }
+  await sendNextTftpDataBlock(socket, key);
+}
+
+async function handleTftpData(socket: dgram.Socket, key: string, block: number, payload: Buffer) {
+  const session = tftpSessions.get(key);
+  if (!session || session.mode !== 'write') return;
+
+  if (block === session.blockNum) {
+    // Duplicate of the last already-written block (our ACK was likely lost) — re-ACK without rewriting.
+    socket.send(session.lastPacket, session.clientPort, session.clientAddress, () => { /* best effort */ });
+    armTftpTimer(socket, key);
+    return;
+  }
+  if (block !== session.blockNum + 1) return; // out of order, ignore
+
+  try {
+    await session.fh.write(payload, 0, payload.length, session.blockNum * TFTP_BLOCK_SIZE);
+  } catch (error: any) {
+    sendTftpError(socket, session.clientAddress, session.clientPort, 3, `Disk write error: ${error.message}`);
+    cleanupTftpSession(key, false);
+    return;
+  }
+
+  session.blockNum = block;
+  session.transferredBytes += payload.length;
+  session.logEntry.fileSize = session.transferredBytes;
+  const ackPacket = buildTftpAckPacket(block);
+  session.pendingBlock = block;
+  session.lastPacket = ackPacket;
+  session.retries = 0;
+  socket.send(ackPacket, session.clientPort, session.clientAddress, () => { /* best effort */ });
+
+  if (payload.length < TFTP_BLOCK_SIZE) {
+    clearTftpTimer(session);
+    cleanupTftpSession(key, true);
+    return;
+  }
+  armTftpTimer(socket, key);
+}
+
+function handleTftpPacket(socket: dgram.Socket, msg: Buffer, rinfo: dgram.RemoteInfo) {
+  if (msg.length < 2) return;
+  const opcode = msg.readUInt16BE(0);
+  const key = tftpSessionKey(rinfo.address, rinfo.port);
+
+  if (opcode === TFTP_OPCODE.RRQ || opcode === TFTP_OPCODE.WRQ) {
+    if (tftpSessions.has(key)) return; // ignore a duplicate initial request for an already-active transfer
+    const parsed = parseTftpRequest(msg);
+    if (!parsed) { sendTftpError(socket, rinfo.address, rinfo.port, 4, "Illegal TFTP operation"); return; }
+    const task = opcode === TFTP_OPCODE.RRQ
+      ? handleTftpRrq(socket, rinfo, parsed.filename)
+      : handleTftpWrq(socket, rinfo, parsed.filename);
+    task.catch(e => console.error("TFTP 요청 처리 오류", e));
+    return;
+  }
+
+  const session = tftpSessions.get(key);
+  if (!session) return; // unrelated/expired transfer, ignore silently
+
+  if (opcode === TFTP_OPCODE.ACK) {
+    handleTftpAck(socket, key, msg.readUInt16BE(2)).catch(e => console.error("TFTP ACK 처리 오류", e));
+  } else if (opcode === TFTP_OPCODE.DATA) {
+    handleTftpData(socket, key, msg.readUInt16BE(2), msg.subarray(4)).catch(e => console.error("TFTP DATA 처리 오류", e));
+  } else if (opcode === TFTP_OPCODE.ERROR) {
+    cleanupTftpSession(key, false);
+  }
+}
+
+function startTftpServer(): Promise<{ success: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    if (tftpSocket) { resolve({ success: true }); return; }
+
+    const socket = dgram.createSocket({ type: "udp4", reuseAddr: true });
+    let settled = false;
+
+    socket.once("error", (err: NodeJS.ErrnoException) => {
+      if (settled) {
+        logDhcp('WARN', `TFTP 서버 소켓 오류: ${err.message}`);
+        return;
+      }
+      settled = true;
+      try { socket.close(); } catch { /* already closed */ }
+      resolve({ success: false, error: describeServiceBindError("TFTP", tftpFtpConfig.tftpPort, err) });
+    });
+
+    socket.on("message", (msg, rinfo) => {
+      try { handleTftpPacket(socket, msg, rinfo); } catch (e) { console.error("TFTP 패킷 처리 중 오류", e); }
+    });
+
+    socket.bind(tftpFtpConfig.tftpPort, "0.0.0.0", () => {
+      if (settled) return;
+      settled = true;
+      tftpSocket = socket;
+      resolve({ success: true });
+    });
+  });
+}
+
+function stopTftpServer() {
+  if (tftpSocket) {
+    try { tftpSocket.close(); } catch { /* already closed */ }
+    tftpSocket = null;
+  }
+  for (const key of Array.from(tftpSessions.keys())) {
+    cleanupTftpSession(key, false);
+  }
+}
+
+// --- Real FTP server (via the `ftp-srv` package — unlike TFTP, a mature,
+// actively-used pure-JS FTP server library exists, so unlike DHCP/TFTP there
+// was no reason to hand-roll this one) ---
+
+// ftp-srv defaults to a verbose bunyan logger writing to stdout for every
+// command; this app surfaces status via the in-app log panel instead, so
+// silence it rather than spamming the (usually invisible, packaged-exe)
+// console.
+function createSilentFtpLogger(): any {
+  const noop = () => { /* silenced */ };
+  const logger: any = { trace: noop, debug: noop, info: noop, warn: noop, error: noop, fatal: noop };
+  logger.child = () => createSilentFtpLogger();
+  return logger;
+}
+
+// ftp-srv registers process-level SIGTERM/SIGINT/SIGQUIT handlers on every
+// `new FtpSrv(...)` and never removes them on close() (a library quirk) — so
+// repeated toggle-off/toggle-on cycles would otherwise accumulate listeners
+// and eventually trip Node's MaxListenersExceededWarning.
+process.setMaxListeners(Math.max(process.getMaxListeners(), 30));
+
+// Resolves the IP address ftp-srv should hand a client for PASV data
+// connections: the address of whichever local adapter shares a subnet with
+// the connecting client (so LAN devices get a reachable LAN IP), falling
+// back to loopback for local testing and to the first adapter otherwise.
+function resolveFtpPasvAddress(remoteAddress: string): string {
+  const clean = remoteAddress.replace(/^::ffff:/, "");
+  if (clean === "127.0.0.1" || clean === "::1") return "127.0.0.1";
+
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const net of interfaces[name] || []) {
+      if ((net.family === "IPv4" || (net.family as any) === 4) && !net.internal && isIpInSubnet(clean, net.address, net.netmask)) {
+        return net.address;
+      }
+    }
+  }
+  for (const name of Object.keys(interfaces)) {
+    for (const net of interfaces[name] || []) {
+      if ((net.family === "IPv4" || (net.family as any) === 4) && !net.internal) return net.address;
+    }
+  }
+  return "127.0.0.1";
+}
+
+let ftpServerInstance: InstanceType<typeof FtpSrv> | null = null;
+
+function startFtpServer(): Promise<{ success: boolean; error?: string }> {
+  if (ftpServerInstance) return Promise.resolve({ success: true });
+
+  const server = new FtpSrv({
+    url: `ftp://0.0.0.0:${tftpFtpConfig.ftpPort}`,
+    pasv_url: resolveFtpPasvAddress,
+    pasv_min: 50000,
+    pasv_max: 50099,
+    greeting: ["Network Server Suite FTP"],
+    anonymous: false,
+    log: createSilentFtpLogger()
+  } as any);
+
+  // This app has no per-user credential store, so any non-empty username is
+  // accepted (an open, LAN-facing file drop — the same trust model as the
+  // TFTP server above, which has no authentication concept at all).
+  server.on('login', ({ connection, username }: any, resolveLogin: any, rejectLogin: any) => {
+    if (!username) { rejectLogin(new Error("사용자 이름이 필요합니다.")); return; }
+
+    connection.on('STOR', (err: Error | null, filePath: string) => {
+      if (err) { logDhcp('WARN', `FTP 업로드 실패: ${err.message}`); return; }
+      try {
+        const stat = fs.statSync(filePath);
+        const entry = logTransferStart('FTP', 'UPLOAD', connection.ip || 'unknown', path.basename(filePath), stat.size);
+        finalizeTransferLog(entry, true, stat.size);
+      } catch { /* file may already be gone; nothing meaningful to log */ }
+    });
+
+    connection.on('RETR', (err: Error | null, filePath: string) => {
+      if (err) { logDhcp('WARN', `FTP 다운로드 실패: ${err.message}`); return; }
+      try {
+        const stat = fs.statSync(filePath);
+        const entry = logTransferStart('FTP', 'DOWNLOAD', connection.ip || 'unknown', path.basename(filePath), stat.size);
+        finalizeTransferLog(entry, true, stat.size);
+      } catch { /* ignore */ }
+    });
+
+    resolveLogin({ root: tftpFtpConfig.rootFolder });
+  });
+
+  // Not in ftp-srv's .on() overload set (only login/disconnect/client-error
+  // are typed) even though the library does emit it — cast to bypass.
+  (server as any).on('server-error', ({ error }: any) => {
+    logDhcp('WARN', `FTP 서버 오류: ${error?.message || error}`);
+  });
+
+  return server.listen()
+    .then(() => {
+      ftpServerInstance = server;
+      return { success: true };
+    })
+    .catch((err: NodeJS.ErrnoException) => {
+      return { success: false, error: describeServiceBindError("FTP", tftpFtpConfig.ftpPort, err) };
+    });
+}
+
+function stopFtpServer(): Promise<void> {
+  if (!ftpServerInstance) return Promise.resolve();
+  const server = ftpServerInstance;
+  ftpServerInstance = null;
+  return server.close().catch(() => { /* best effort */ });
+}
+
 // TFTP / FTP File Service Controls
-app.post("/api/tftpftp/toggle", (req, res) => {
+app.post("/api/tftpftp/toggle", async (req, res) => {
   const { service, enabled } = req.body; // 'TFTP' or 'FTP'
-  
+
   if (service === 'TFTP') {
+    if (enabled) {
+      const result = await startTftpServer();
+      if (!result.success) {
+        logDhcp('WARN', result.error || "TFTP 서버를 시작할 수 없습니다.");
+        return res.json({ success: false, error: result.error, systemStatus, tftpFtpConfig });
+      }
+      logDhcp('SUCCESS', `TFTP 서버가 포트 ${tftpFtpConfig.tftpPort}에서 시작되었습니다. 공유 폴더: ${tftpFtpConfig.rootFolder}`);
+    } else {
+      stopTftpServer();
+      logDhcp('INFO', "TFTP 서버가 중지되었습니다.");
+    }
     systemStatus.tftpRunning = enabled;
     tftpFtpConfig.tftpEnabled = enabled;
   } else if (service === 'FTP') {
+    if (enabled) {
+      const result = await startFtpServer();
+      if (!result.success) {
+        logDhcp('WARN', result.error || "FTP 서버를 시작할 수 없습니다.");
+        return res.json({ success: false, error: result.error, systemStatus, tftpFtpConfig });
+      }
+      logDhcp('SUCCESS', `FTP 서버가 포트 ${tftpFtpConfig.ftpPort}에서 시작되었습니다. 공유 폴더: ${tftpFtpConfig.rootFolder}`);
+    } else {
+      await stopFtpServer();
+      logDhcp('INFO', "FTP 서버가 중지되었습니다.");
+    }
     systemStatus.ftpRunning = enabled;
     tftpFtpConfig.ftpEnabled = enabled;
   }
-  
+
   saveState();
   res.json({ success: true, systemStatus, tftpFtpConfig });
 });
@@ -1699,6 +2198,37 @@ app.post("/api/tftpftp/config", (req, res) => {
   res.json({ success: true, tftpFtpConfig });
 });
 
+// Opens a native Windows folder-picker on the server machine (this app is a
+// locally-run desktop suite, so "the server machine" is the same machine the
+// browser is on) via a PowerShell FolderBrowserDialog, so the shared folder
+// can be selected instead of hand-typing a path. Only fills in the field on
+// the frontend — the existing /api/tftpftp/config route above still does the
+// actual validation/apply when the user saves.
+app.post("/api/tftpftp/browse-folder", async (req, res) => {
+  const script = `
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$owner.ShowInTaskbar = $false
+$owner.StartPosition = 'CenterScreen'
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = 'TFTP/FTP 공유 폴더 선택'
+$dialog.ShowNewFolderButton = $true
+$result = $dialog.ShowDialog($owner)
+$owner.Dispose()
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath } else { Write-Output '__CANCELLED__' }
+`;
+  const result = await runPowerShellScript(script);
+  if (!result.success) {
+    return res.status(500).json({ error: result.error || result.stderr || "폴더 선택 창을 열 수 없습니다." });
+  }
+  const output = result.stdout.trim();
+  if (!output || output === "__CANCELLED__") {
+    return res.json({ success: true, cancelled: true });
+  }
+  res.json({ success: true, path: output });
+});
+
 // Resolves a user-supplied file name against the current served-folder root,
 // rejecting any path that would escape outside of it (e.g. via "../").
 function resolveServedPath(baseDir: string, name: string): string | null {
@@ -1744,66 +2274,6 @@ app.post("/api/files/create", (req, res) => {
   } catch (error: any) {
     res.status(500).json({ error: error.message });
   }
-});
-
-app.post("/api/files/upload-simulated", (req, res) => {
-  const { name, size, type } = req.body; // 'FTP' or 'TFTP'
-  if (!name) return res.status(400).json({ error: "Missing name" });
-
-  const baseDir = tftpFtpConfig.rootFolder;
-  const filePath = resolveServedPath(baseDir, name);
-  if (!filePath) return res.status(400).json({ error: "잘못된 파일 경로입니다." });
-
-  try {
-    fs.writeFileSync(filePath, `SIMULATED FILE BODY FOR ${name}`);
-
-    // Create direct progress log
-    const logId = "transfer-" + Date.now();
-    transferLogs.push({
-      id: logId,
-      service: type || 'TFTP',
-      clientIp: `192.168.1.${Math.floor(Math.random() * 100) + 101}`,
-      operation: 'UPLOAD',
-      fileName: name,
-      fileSize: size || 1024 * 50,
-      progress: 0,
-      speed: '4.2 MB/s',
-      status: 'IN_PROGRESS',
-      timestamp: new Date().toISOString()
-    });
-
-    saveState();
-    res.json({ success: true, transferLogs });
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.post("/api/files/download-simulated", (req, res) => {
-  const { name, type } = req.body;
-
-  const baseDir = tftpFtpConfig.rootFolder;
-  const filePath = resolveServedPath(baseDir, name);
-  if (!filePath) return res.status(400).json({ error: "잘못된 파일 경로입니다." });
-  if (!fs.existsSync(filePath)) return res.status(404).json({ error: "File not found" });
-
-  const stat = fs.statSync(filePath);
-  const logId = "transfer-" + Date.now();
-  transferLogs.push({
-    id: logId,
-    service: type || 'FTP',
-    clientIp: `192.168.1.${Math.floor(Math.random() * 100) + 101}`,
-    operation: 'DOWNLOAD',
-    fileName: name,
-    fileSize: stat.size,
-    progress: 0,
-    speed: '6.1 MB/s',
-    status: 'IN_PROGRESS',
-    timestamp: new Date().toISOString()
-  });
-
-  saveState();
-  res.json({ success: true, transferLogs });
 });
 
 app.delete("/api/files/:name", (req, res) => {
@@ -2792,12 +3262,18 @@ app.post("/api/system/config", (req, res) => {
   res.json({ success: true, systemStatus });
 });
 
-app.post("/api/system/reset", (req, res) => {
+app.post("/api/system/reset", async (req, res) => {
   // Clear persistent file state
   if (fs.existsSync(STATE_FILE)) {
     fs.unlinkSync(STATE_FILE);
   }
-  
+
+  // Actually stop any real running engines — otherwise the status flags below
+  // would say "off" while DHCP/TFTP/FTP kept running for real in the background.
+  stopDhcpServer();
+  stopTftpServer();
+  await stopFtpServer();
+
   // Clear variables to empty states
   systemStatus = {
     dhcpRunning: false,
@@ -2891,6 +3367,30 @@ async function startServer() {
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Network Server Suite] Backend running on port ${PORT}`);
   });
+
+  // loadState()'s autoStart block (above) only sets systemStatus.tftpRunning/
+  // ftpRunning flags — it can't call the real start functions itself since
+  // they're defined later in this file. Actually bind the real engines here
+  // so a restored "was running" state means the server is really running
+  // again, not just showing a green dot. (DHCP intentionally excluded: its
+  // real-network-conflict risk is meant to require the user to consciously
+  // re-confirm via the UI toggle each time, not silently rebind on boot.)
+  if (systemStatus.tftpRunning) {
+    const result = await startTftpServer();
+    if (!result.success) {
+      systemStatus.tftpRunning = false;
+      tftpFtpConfig.tftpEnabled = false;
+      logDhcp('WARN', result.error || "TFTP 자동 시작에 실패했습니다.");
+    }
+  }
+  if (systemStatus.ftpRunning) {
+    const result = await startFtpServer();
+    if (!result.success) {
+      systemStatus.ftpRunning = false;
+      tftpFtpConfig.ftpEnabled = false;
+      logDhcp('WARN', result.error || "FTP 자동 시작에 실패했습니다.");
+    }
+  }
 }
 
 // Best-effort cleanup of any still-open SSH/Telnet terminal sessions on exit.
