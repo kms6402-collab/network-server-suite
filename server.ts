@@ -987,12 +987,25 @@ function subnetMaskToPrefixLength(mask: string): number | null {
 // interface names / IPs containing quotes or other shell-special characters
 // can never be misinterpreted or break out of the invocation — there's no
 // shell parsing of the payload at all, unlike passing raw text as -Command.
+//
+// The preamble forces the console's OUTPUT encoding to UTF-8: Windows
+// PowerShell 5.1 (unlike PowerShell 7) defaults the console output codepage
+// to the system's legacy ANSI/OEM codepage (e.g. CP949 on Korean Windows)
+// regardless of how the script itself was encoded, so any non-ASCII text a
+// script writes via Write-Output (e.g. a Korean folder path picked in
+// /api/tftpftp/browse-folder) comes back as mojibake once Node decodes the
+// child process's stdout as UTF-8. Do not remove this — it's the fix for
+// Korean text/paths not displaying correctly. $ProgressPreference is
+// silenced too, since some cmdlets (New-Object, New-NetIPAddress, ...) emit
+// a progress record to stderr that would otherwise show up as CLIXML noise.
 function runPowerShellScript(script: string): Promise<{ success: boolean; stdout: string; stderr: string; error?: string }> {
   return new Promise((resolve) => {
-    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    const preamble = "$ProgressPreference = 'SilentlyContinue'; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false;\n";
+    const encoded = Buffer.from(preamble + script, "utf16le").toString("base64");
     execFile(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { encoding: "utf8" },
       (error, stdout, stderr) => {
         resolve({ success: !error, stdout: (stdout || "").trim(), stderr: (stderr || "").trim(), error: error?.message });
       }
@@ -1749,7 +1762,11 @@ function buildTftpErrorPacket(code: number, message: string): Buffer {
 function parseTftpRequest(msg: Buffer): { filename: string; mode: string } | null {
   const nullIdx1 = msg.indexOf(0, 2);
   if (nullIdx1 === -1) return null;
-  const filename = msg.toString("ascii", 2, nullIdx1);
+  // "utf8" rather than "ascii": ascii strips the high bit off every byte, so
+  // any non-ASCII filename (e.g. Korean, sent as UTF-8 bytes by every modern
+  // TFTP client) came out corrupted. utf8 decodes plain ASCII names
+  // identically while also handling Korean/other UTF-8 filenames correctly.
+  const filename = msg.toString("utf8", 2, nullIdx1);
   const nullIdx2 = msg.indexOf(0, nullIdx1 + 1);
   if (nullIdx2 === -1) return null;
   const mode = msg.toString("ascii", nullIdx1 + 1, nullIdx2).toLowerCase();
@@ -2213,10 +2230,24 @@ app.post("/api/tftpftp/config", (req, res) => {
 
 // Opens a native Windows folder-picker on the server machine (this app is a
 // locally-run desktop suite, so "the server machine" is the same machine the
-// browser is on) via a PowerShell FolderBrowserDialog, so the shared folder
-// can be selected instead of hand-typing a path. Only fills in the field on
-// the frontend — the existing /api/tftpftp/config route above still does the
-// actual validation/apply when the user saves.
+// browser is on), so the shared folder can be selected instead of
+// hand-typing a path. Only fills in the field on the frontend — the existing
+// /api/tftpftp/config route above still does the actual validation/apply
+// when the user saves.
+//
+// Uses the Shell.Application COM folder browser with the BIF_USENEWUI style
+// (BIF_NEWDIALOGSTYLE | BIF_EDITBOX, 0x50) instead of WinForms'
+// FolderBrowserDialog: the plain FolderBrowserDialog is the legacy
+// SHBrowseForFolder tree-only dialog with no address/path field at all, so a
+// path could only be reached by clicking through the tree level by level and
+// pasting was impossible. BIF_EDITBOX adds a real text box at the bottom of
+// the dialog that accepts typing/pasting a full path directly (and
+// auto-navigates the tree to match), while BIF_NEWDIALOGSTYLE makes the
+// window resizable with normal Explorer context menus (new folder,
+// rename, delete). BIF_RETURNONLYFSDIRS (0x1) keeps virtual/non-filesystem
+// nodes (Control Panel, etc.) from being selectable, hence 0x51 total. The
+// hidden TopMost owner form is only there so the dialog reliably comes to
+// the foreground instead of opening behind the browser window.
 app.post("/api/tftpftp/browse-folder", async (req, res) => {
   const script = `
 Add-Type -AssemblyName System.Windows.Forms
@@ -2224,12 +2255,11 @@ $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $owner.ShowInTaskbar = $false
 $owner.StartPosition = 'CenterScreen'
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = 'TFTP/FTP 공유 폴더 선택'
-$dialog.ShowNewFolderButton = $true
-$result = $dialog.ShowDialog($owner)
+$ownerHandle = $owner.Handle
+$shellApp = New-Object -ComObject Shell.Application
+$folder = $shellApp.BrowseForFolder($ownerHandle.ToInt32(), 'TFTP/FTP 공유 폴더 선택 (경로를 직접 입력하거나 붙여넣을 수 있습니다)', 0x51, 0)
 $owner.Dispose()
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $dialog.SelectedPath } else { Write-Output '__CANCELLED__' }
+if ($folder -ne $null) { Write-Output $folder.Self.Path } else { Write-Output '__CANCELLED__' }
 `;
   const result = await runPowerShellScript(script);
   if (!result.success) {
