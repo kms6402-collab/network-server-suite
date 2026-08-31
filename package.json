@@ -1,7 +1,7 @@
 {
   "name": "network-server-suite",
   "private": true,
-  "version": "2.4.1",
+  "version": "2.5.0",
   "type": "module",
   "bin": "dist/server.cjs",
   "pkg": {

@@ -65,6 +65,11 @@ export default function TerminalAutomation({
   const [hostProtocol, setHostProtocol] = useState<'SSH' | 'TELNET'>("SSH");
   const [hostUser, setHostUser] = useState("");
   const [hostPass, setHostPass] = useState("");
+  // When checked, the device is registered with no username/password at all
+  // — only meaningful for TELNET, where a script can answer the device's own
+  // login/password prompt as plain commands after a raw connect. SSH always
+  // needs real credentials to authenticate, so this stays forced off there.
+  const [hostNoAccount, setHostNoAccount] = useState(false);
   const [showHostForm, setShowHostForm] = useState(false);
   // Non-null while editing an existing device profile instead of creating a new one.
   const [editingHostId, setEditingHostId] = useState<string | null>(null);
@@ -79,6 +84,7 @@ export default function TerminalAutomation({
   const [importPort, setImportPort] = useState(22);
   const [importUser, setImportUser] = useState("");
   const [importPass, setImportPass] = useState("");
+  const [importNoAccount, setImportNoAccount] = useState(false);
   const [importResultMsg, setImportResultMsg] = useState<string | null>(null);
 
   // Bulk update panel state ("변경 안 함" defaults = empty string / not selected)
@@ -252,6 +258,7 @@ export default function TerminalAutomation({
     setHostPort(hostProtocol === 'SSH' ? 22 : 23);
     setHostUser("");
     setHostPass("");
+    setHostNoAccount(false);
     setShowHostForm(false);
     setEditingHostId(null);
   };
@@ -266,6 +273,7 @@ export default function TerminalAutomation({
     setHostIp("");
     setHostUser("");
     setHostPass("");
+    setHostNoAccount(false);
     setHostPort(hostProtocol === 'SSH' ? 22 : 23);
     setShowHostForm(true);
   };
@@ -278,12 +286,29 @@ export default function TerminalAutomation({
     setHostProtocol(host.protocol);
     setHostUser(host.username);
     setHostPass(""); // never re-display the stored secret; blank = keep unchanged
+    setHostNoAccount(!host.username && !host.password);
     setShowHostForm(true);
+  };
+
+  // Switching to SSH while "계정 정보 없이 등록" is checked would silently
+  // register a host that can never authenticate, so force it back off.
+  const handleHostProtocolChange = (p: 'SSH' | 'TELNET') => {
+    setHostProtocol(p);
+    setHostPort(p === 'SSH' ? 22 : 23);
+    if (p === 'SSH') setHostNoAccount(false);
+  };
+
+  const handleToggleHostNoAccount = (checked: boolean) => {
+    setHostNoAccount(checked);
+    if (checked) {
+      setHostUser("");
+      setHostPass("");
+    }
   };
 
   const handleAddHostSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!hostName || !hostIp || !hostUser) return;
+    if (!hostName || !hostIp || (!hostNoAccount && !hostUser)) return;
     if (editingHostId) {
       onUpdateHost(editingHostId, hostName, hostIp, hostPort, hostProtocol, hostUser, hostPass || undefined);
     } else {
@@ -314,6 +339,21 @@ export default function TerminalAutomation({
     setImportPort(22);
     setImportUser("");
     setImportPass("");
+    setImportNoAccount(false);
+  };
+
+  const handleImportProtocolChange = (p: 'SSH' | 'TELNET') => {
+    setImportProtocol(p);
+    setImportPort(p === 'SSH' ? 22 : 23);
+    if (p === 'SSH') setImportNoAccount(false);
+  };
+
+  const handleToggleImportNoAccount = (checked: boolean) => {
+    setImportNoAccount(checked);
+    if (checked) {
+      setImportUser("");
+      setImportPass("");
+    }
   };
 
   const toggleLeaseSelected = (id: string) => {
@@ -333,7 +373,7 @@ export default function TerminalAutomation({
 
   const handleDhcpImportSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (selectedLeaseIds.size === 0 || !importUser) return;
+    if (selectedLeaseIds.size === 0 || (!importNoAccount && !importUser)) return;
     const devices = importableLeases
       .filter(l => selectedLeaseIds.has(l.id))
       .map(l => ({ name: l.hostname || l.ip, ip: l.ip }));
@@ -621,11 +661,7 @@ export default function TerminalAutomation({
                   <select
                     className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
                     value={importProtocol}
-                    onChange={(e) => {
-                      const p = e.target.value as 'SSH' | 'TELNET';
-                      setImportProtocol(p);
-                      setImportPort(p === 'SSH' ? 22 : 23);
-                    }}
+                    onChange={(e) => handleImportProtocolChange(e.target.value as 'SSH' | 'TELNET')}
                   >
                     <option value="SSH">SSH</option>
                     <option value="TELNET">TELNET</option>
@@ -642,26 +678,47 @@ export default function TerminalAutomation({
                   />
                 </div>
               </div>
+
+              <label className={`flex items-start gap-2 px-2 py-1.5 rounded-lg border select-none ${importProtocol === 'SSH' ? 'border-slate-850 opacity-40 cursor-not-allowed' : 'border-slate-800 cursor-pointer hover:bg-slate-900'}`}>
+                <input
+                  type="checkbox"
+                  className="accent-indigo-500 mt-0.5 shrink-0"
+                  checked={importNoAccount}
+                  disabled={importProtocol === 'SSH'}
+                  onChange={(e) => handleToggleImportNoAccount(e.target.checked)}
+                />
+                <span className="text-slate-300">
+                  계정 정보 없이 등록
+                  <span className="block text-[9px] text-slate-500 font-normal mt-0.5">
+                    {importProtocol === 'SSH'
+                      ? 'SSH는 인증 없이 접속할 수 없어 이 옵션을 사용할 수 없습니다.'
+                      : '로그인 없이 연결만 하고, 스크립트의 명령으로 아이디/비밀번호를 직접 입력합니다.'}
+                  </span>
+                </span>
+              </label>
+
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">사용자 계정 (User)</label>
                   <input
                     type="text"
-                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
                     placeholder="admin"
                     value={importUser}
                     onChange={(e) => setImportUser(e.target.value)}
-                    required
+                    disabled={importNoAccount}
+                    required={!importNoAccount}
                   />
                 </div>
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">비밀번호 (Secret)</label>
                   <input
                     type="password"
-                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
-                    placeholder="••••••••"
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
+                    placeholder={importNoAccount ? "" : "••••••••"}
                     value={importPass}
                     onChange={(e) => setImportPass(e.target.value)}
+                    disabled={importNoAccount}
                   />
                 </div>
               </div>
@@ -678,7 +735,7 @@ export default function TerminalAutomation({
                 <button
                   id="submit-dhcp-import-btn"
                   type="submit"
-                  disabled={selectedLeaseIds.size === 0 || !importUser}
+                  disabled={selectedLeaseIds.size === 0 || (!importNoAccount && !importUser)}
                   className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-30 disabled:pointer-events-none text-white rounded-lg font-bold cursor-pointer transition"
                 >
                   {selectedLeaseIds.size}개 가져오기
@@ -794,11 +851,7 @@ export default function TerminalAutomation({
                   <select
                     className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
                     value={hostProtocol}
-                    onChange={(e) => {
-                      const p = e.target.value as 'SSH' | 'TELNET';
-                      setHostProtocol(p);
-                      setHostPort(p === 'SSH' ? 22 : 23);
-                    }}
+                    onChange={(e) => handleHostProtocolChange(e.target.value as 'SSH' | 'TELNET')}
                   >
                     <option value="SSH">SSH</option>
                     <option value="TELNET">TELNET</option>
@@ -816,25 +869,45 @@ export default function TerminalAutomation({
                 </div>
               </div>
 
+              <label className={`flex items-start gap-2 px-2 py-1.5 rounded-lg border select-none ${hostProtocol === 'SSH' ? 'border-slate-850 opacity-40 cursor-not-allowed' : 'border-slate-800 cursor-pointer hover:bg-slate-900'}`}>
+                <input
+                  type="checkbox"
+                  className="accent-indigo-500 mt-0.5 shrink-0"
+                  checked={hostNoAccount}
+                  disabled={hostProtocol === 'SSH'}
+                  onChange={(e) => handleToggleHostNoAccount(e.target.checked)}
+                />
+                <span className="text-slate-300">
+                  계정 정보 없이 등록
+                  <span className="block text-[9px] text-slate-500 font-normal mt-0.5">
+                    {hostProtocol === 'SSH'
+                      ? 'SSH는 인증 없이 접속할 수 없어 이 옵션을 사용할 수 없습니다.'
+                      : '로그인 없이 연결만 하고, 스크립트의 명령으로 아이디/비밀번호를 직접 입력합니다.'}
+                  </span>
+                </span>
+              </label>
+
               <div className="grid grid-cols-2 gap-2">
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">사용자 계정 (User)</label>
                   <input
                     type="text"
-                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
                     placeholder="admin"
                     value={hostUser}
                     onChange={(e) => setHostUser(e.target.value)}
-                    required
+                    disabled={hostNoAccount}
+                    required={!hostNoAccount}
                   />
                 </div>
                 <div>
                   <label className="block text-slate-300 font-bold mb-1">비밀번호 (Secret)</label>
                   <input
                     type="password"
-                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none"
-                    placeholder={editingHostId ? "비워두면 기존 비밀번호 유지" : "••••••••"}
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
+                    placeholder={hostNoAccount ? "" : editingHostId ? "비워두면 기존 비밀번호 유지" : "••••••••"}
                     value={hostPass}
+                    disabled={hostNoAccount}
                     onChange={(e) => setHostPass(e.target.value)}
                   />
                 </div>
@@ -924,7 +997,7 @@ export default function TerminalAutomation({
                         </span>
                         <span>{host.ip}:{host.port}</span>
                         <span>•</span>
-                        <span>U: {host.username}</span>
+                        <span>{host.username ? `U: ${host.username}` : '계정 없음'}</span>
                       </div>
                     </div>
                   </div>

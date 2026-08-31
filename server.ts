@@ -2382,14 +2382,19 @@ app.post("/api/tftpftp/transfers/clear", (req, res) => {
 
 
 // TERMINAL & AUTOMATION SCRIPTS
+// `username` is intentionally not required: a device can be registered with
+// no account info at all (SSH still needs credentials to authenticate at
+// connect time, but a TELNET device's own login prompt can instead be
+// answered by the script's own commands after a raw connect — see the
+// `!host.password` branch in runScriptExecution/runTelnetExecution below).
 app.post("/api/hosts", (req, res) => {
   const { name, ip, port, protocol, username, password } = req.body;
-  if (!name || !ip || !port || !protocol || !username) {
+  if (!name || !ip || !port || !protocol) {
     return res.status(400).json({ error: "Missing required fields" });
   }
-  
+
   const id = "host-" + Date.now();
-  const host: TerminalHost = { id, name, ip, port: Number(port), protocol, username, password };
+  const host: TerminalHost = { id, name, ip, port: Number(port), protocol, username: username || "", password };
   terminalHosts.push(host);
   saveState();
   res.json({ success: true, terminalHosts });
@@ -2409,7 +2414,7 @@ app.delete("/api/hosts/:id", (req, res) => {
 app.put("/api/hosts/:id", (req, res) => {
   const { id } = req.params;
   const { name, ip, port, protocol, username, password } = req.body;
-  if (!name || !ip || !port || !protocol || !username) {
+  if (!name || !ip || !port || !protocol) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
@@ -2422,7 +2427,7 @@ app.put("/api/hosts/:id", (req, res) => {
   host.ip = ip;
   host.port = Number(port);
   host.protocol = protocol;
-  host.username = username;
+  host.username = username || "";
   if (password) host.password = password;
 
   saveState();
@@ -2435,7 +2440,7 @@ app.put("/api/hosts/:id", (req, res) => {
 // whose IP is already registered are skipped to avoid duplicate entries.
 app.post("/api/hosts/bulk-import", (req, res) => {
   const { devices, protocol, port, username, password } = req.body;
-  if (!Array.isArray(devices) || devices.length === 0 || !protocol || !port || !username) {
+  if (!Array.isArray(devices) || devices.length === 0 || !protocol || !port) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
@@ -2458,7 +2463,7 @@ app.post("/api/hosts/bulk-import", (req, res) => {
       ip: device.ip,
       port: Number(port),
       protocol,
-      username,
+      username: username || "",
       password
     };
     terminalHosts.push(host);
@@ -2867,17 +2872,51 @@ function runTelnetExecution(
     connection.on("error", (err: any) => handleSessionEnd(err));
     connection.on("close", () => handleSessionEnd());
 
+    // A host registered with no account info (no password — see the
+    // /api/hosts routes) must skip telnet-client's automatic login handshake
+    // entirely, so the device's own login/password prompt flows through as
+    // plain output for the script's commands to answer directly (exactly
+    // like a human typing into a raw telnet client) instead of the library
+    // intercepting it.
+    //
+    // IMPORTANT: this is NOT achieved by simply omitting username/password/
+    // shellPrompt from the options below. telnet-client's defaultOptions
+    // ships non-empty fallbacks for all of them (username 'root', password
+    // 'guest', shellPrompt /(?:\/ )?#\s/, loginPrompt /login[: ]*$/i,
+    // passwordPrompt /password[: ]*$/i) which Object.assign onto its
+    // internal opts, so an omitted key silently leaves that default active
+    // — confirmed by testing: omitting them still made the library try to
+    // auto-answer a "Password:" prompt with the literal string 'guest'.
+    // The actual, verified way to disable it is to pass an *explicitly
+    // falsy* `shellPrompt`. telnet-client's `socket.on('connect', ...)`
+    // handler checks `if (!this.opts.shellPrompt)` and, if so, immediately
+    // sets its internal state to 'standby' before any data has arrived.
+    // Once in 'standby', its parseData() login-detection branch (which only
+    // runs in state 'getprompt') can never run again for the rest of the
+    // session, so every byte the device sends is just forwarded as-is and
+    // username/password/loginPrompt/passwordPrompt become irrelevant (kept
+    // here as an unmatchable regex purely as defense in depth, in case a
+    // future telnet-client version changes this internal detail).
+    const hasCredentials = !!host.password;
+    const NEVER_MATCH = /(?!)/;
     try {
       await connection.connect({
         host: host.ip,
         port: host.port,
-        username: host.username,
-        password: host.password,
         timeout: 10000,
-        shellPrompt: /[$%#>]\s*$/,
-        loginPrompt: /login[: ]*$/i,
-        passwordPrompt: /password[: ]*$/i,
-        failedLoginMatch: /(?:incorrect|failed|denied|invalid)/i,
+        ...(hasCredentials ? {
+          username: host.username,
+          password: host.password,
+          shellPrompt: /[$%#>]\s*$/,
+          loginPrompt: /login[: ]*$/i,
+          passwordPrompt: /password[: ]*$/i,
+          failedLoginMatch: /(?:incorrect|failed|denied|invalid)/i,
+        } : {
+          shellPrompt: false as unknown as RegExp,
+          loginPrompt: NEVER_MATCH,
+          passwordPrompt: NEVER_MATCH,
+          failedLoginMatch: NEVER_MATCH,
+        }),
         // IMPORTANT: must stay true (the telnet-client default). When false,
         // connect() resolves the instant the raw TCP socket connects instead
         // of waiting for the login/password handshake to actually finish
@@ -2890,7 +2929,8 @@ function runTelnetExecution(
         // never made it into the log in the right place. Keeping this true
         // makes connect() only resolve once the shell prompt is actually
         // reached, so every scripted command is guaranteed to be sent one at
-        // a time to a fully logged-in shell.
+        // a time to a fully logged-in shell. (When hasCredentials is false,
+        // this has no effect either way — see the shellPrompt note above.)
         negotiationMandatory: true
       });
     } catch (err) {
@@ -2898,7 +2938,11 @@ function runTelnetExecution(
       return;
     }
 
-    appendLog(`[${nowStr()}] TELNET 인증 성공. 명령 실행을 시작합니다...`);
+    appendLog(
+      hasCredentials
+        ? `[${nowStr()}] TELNET 인증 성공. 명령 실행을 시작합니다...`
+        : `[${nowStr()}] TELNET 연결 성공 (등록된 계정 정보 없음 — 자동 로그인 없이 원본 연결만 열었습니다). 명령 실행을 시작합니다...`
+    );
 
     try {
       const socket = connection.getSocket();
@@ -2945,8 +2989,15 @@ async function runScriptExecution(execId: string, host: TerminalHost, script: Co
     if (currentExec) currentExec.logs.push(text);
   };
 
-  if (!host.password) {
-    appendLog(`[${nowStr()}] [오류] 이 호스트에 등록된 비밀번호가 없어 접속할 수 없습니다.`);
+  // SSH authenticates as part of the protocol handshake itself, so there's no
+  // way to reach a shell without valid credentials — unlike TELNET, a script
+  // can't "type" a username/password into an SSH session that never
+  // authenticated in the first place. A password-less TELNET host is allowed
+  // through: runTelnetExecution below skips the automatic login entirely and
+  // just opens the raw connection, so the script's own commands can answer
+  // whatever login/password prompt the device shows.
+  if (!host.password && host.protocol === "SSH") {
+    appendLog(`[${nowStr()}] [오류] SSH는 등록된 비밀번호 없이는 접속할 수 없습니다. 호스트에 계정 정보를 등록하세요.`);
     const currentExec = scriptExecutions.find(e => e.id === execId);
     if (currentExec) {
       currentExec.status = "failed";
@@ -2999,7 +3050,7 @@ app.post("/api/scripts/execute", (req, res) => {
 
   const execId = "exec-" + Date.now();
   const initialLogs = [
-    `[${nowStr()}] ${host.protocol} 접속을 시도합니다: ${host.ip}:${host.port} (사용자: ${host.username})...`
+    `[${nowStr()}] ${host.protocol} 접속을 시도합니다: ${host.ip}:${host.port} (${host.username ? `사용자: ${host.username}` : "계정 정보 없음"})...`
   ];
 
   const execution: ScriptExecution = {
@@ -3085,7 +3136,7 @@ app.post("/api/terminal/connect", (req, res) => {
   const execId = "exec-" + Date.now();
   const manualScript: CommandScript = { id: "manual", name: "수동 연결", description: "", commands: [] };
   const initialLogs = [
-    `[${nowStr()}] ${host.protocol} 수동 접속을 시도합니다: ${host.ip}:${host.port} (사용자: ${host.username})...`
+    `[${nowStr()}] ${host.protocol} 수동 접속을 시도합니다: ${host.ip}:${host.port} (${host.username ? `사용자: ${host.username}` : "계정 정보 없음"})...`
   ];
 
   const execution: ScriptExecution = {
