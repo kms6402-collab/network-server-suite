@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Terminal, ShieldCheck, Plus, Trash2, Play, Pencil,
   Send, Server, AlertCircle, RefreshCw, Download, Plug, Unplug, Radio,
-  Wifi, CheckSquare, Square, PencilLine, X, XCircle, Save, Bookmark
+  Wifi, CheckSquare, Square, PencilLine, X, XCircle, Save, Bookmark, Search
 } from 'lucide-react';
 import { TerminalHost, CommandScript, ScriptExecution, DhcpLease, BatchJob } from '../types';
 
@@ -80,6 +80,11 @@ export default function TerminalAutomation({
   // DHCP import panel state
   const [showDhcpImportPanel, setShowDhcpImportPanel] = useState(false);
   const [selectedLeaseIds, setSelectedLeaseIds] = useState<Set<string>>(new Set());
+  // Filters the lease checklist by hostname/IP/MAC substring (case-insensitive);
+  // "전체 선택/해제" and the checkbox list below only act on whatever this
+  // filter currently leaves visible, so a filtered-down search can be used to
+  // register just a specific subset of leases without hunting through the rest.
+  const [leaseFilterText, setLeaseFilterText] = useState("");
   const [importProtocol, setImportProtocol] = useState<'SSH' | 'TELNET'>("SSH");
   const [importPort, setImportPort] = useState(22);
   const [importUser, setImportUser] = useState("");
@@ -95,6 +100,15 @@ export default function TerminalAutomation({
   const [bulkPass, setBulkPass] = useState("");
 
   const importableLeases = leases.filter(l => l.id !== 'host-pc-self');
+  const filteredImportableLeases = (() => {
+    const q = leaseFilterText.trim().toLowerCase();
+    if (!q) return importableLeases;
+    return importableLeases.filter(l =>
+      (l.hostname || '').toLowerCase().includes(q) ||
+      l.ip.toLowerCase().includes(q) ||
+      l.mac.toLowerCase().includes(q)
+    );
+  })();
 
   // Script Form State
   const [scriptName, setScriptName] = useState("");
@@ -335,6 +349,7 @@ export default function TerminalAutomation({
   const resetDhcpImportPanel = () => {
     setShowDhcpImportPanel(false);
     setSelectedLeaseIds(new Set());
+    setLeaseFilterText("");
     setImportProtocol("SSH");
     setImportPort(22);
     setImportUser("");
@@ -364,10 +379,20 @@ export default function TerminalAutomation({
     });
   };
 
-  const toggleSelectAllLeases = () => {
+  // Acts only on whatever the filter currently leaves visible: selections on
+  // leases outside the filtered view are left untouched, so narrowing the
+  // filter and hitting "전체 선택/해제" registers just that subset instead of
+  // silently wiping out an existing broader selection.
+  const toggleSelectAllFilteredLeases = () => {
     setSelectedLeaseIds(prev => {
-      if (prev.size === importableLeases.length) return new Set();
-      return new Set(importableLeases.map(l => l.id));
+      const next = new Set(prev);
+      const allFilteredSelected = filteredImportableLeases.length > 0 && filteredImportableLeases.every(l => next.has(l.id));
+      if (allFilteredSelected) {
+        filteredImportableLeases.forEach(l => next.delete(l.id));
+      } else {
+        filteredImportableLeases.forEach(l => next.add(l.id));
+      }
+      return next;
     });
   };
 
@@ -622,21 +647,41 @@ export default function TerminalAutomation({
                 DHCP 임대 선택 후 등록
               </span>
 
+              <div className="relative">
+                <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                <input
+                  type="text"
+                  className="w-full bg-slate-900 border border-slate-800 rounded-lg py-1.5 pl-8 pr-7 text-white text-[11px] focus:outline-none focus:border-emerald-500"
+                  placeholder="호스트명 / IP / MAC으로 필터"
+                  value={leaseFilterText}
+                  onChange={(e) => setLeaseFilterText(e.target.value)}
+                />
+                {leaseFilterText && (
+                  <button
+                    type="button"
+                    onClick={() => setLeaseFilterText("")}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+
               <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold">
                 <label className="flex items-center gap-1.5 cursor-pointer select-none">
                   <input
                     type="checkbox"
                     className="accent-indigo-500 cursor-pointer"
-                    checked={importableLeases.length > 0 && selectedLeaseIds.size === importableLeases.length}
-                    onChange={toggleSelectAllLeases}
+                    checked={filteredImportableLeases.length > 0 && filteredImportableLeases.every(l => selectedLeaseIds.has(l.id))}
+                    onChange={toggleSelectAllFilteredLeases}
                   />
-                  전체 선택/해제
+                  전체 선택/해제{leaseFilterText ? ` (필터된 ${filteredImportableLeases.length}개)` : ''}
                 </label>
                 <span>{selectedLeaseIds.size} / {importableLeases.length}개 선택됨</span>
               </div>
 
-              <div className="max-h-[130px] overflow-y-auto space-y-1.5 border border-slate-850 rounded-lg p-2 bg-slate-900/40">
-                {importableLeases.map(lease => (
+              <div className="max-h-[150px] overflow-y-auto space-y-1.5 border border-slate-850 rounded-lg p-2 bg-slate-900/40">
+                {filteredImportableLeases.map(lease => (
                   <label key={lease.id} className="flex items-center gap-2 px-1.5 py-1 rounded hover:bg-slate-900 cursor-pointer select-none">
                     <input
                       type="checkbox"
@@ -644,13 +689,22 @@ export default function TerminalAutomation({
                       checked={selectedLeaseIds.has(lease.id)}
                       onChange={() => toggleLeaseSelected(lease.id)}
                     />
-                    <span className="font-bold text-white truncate">{lease.hostname || '(unknown)'}</span>
-                    <span className="font-mono text-slate-400 shrink-0">{lease.ip}</span>
-                    <span className="font-mono text-slate-500 shrink-0">{lease.mac}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block font-bold text-white truncate" title={lease.hostname || '(unknown)'}>
+                        {lease.hostname || '(unknown)'}
+                      </span>
+                      <span className="flex items-center gap-1.5 font-mono text-[9px] text-slate-500">
+                        <span className="text-slate-400">{lease.ip}</span>
+                        <span>{lease.mac}</span>
+                      </span>
+                    </span>
                   </label>
                 ))}
                 {importableLeases.length === 0 && (
                   <div className="text-slate-500 text-center py-4 text-[10px]">가져올 DHCP 임대가 없습니다.</div>
+                )}
+                {importableLeases.length > 0 && filteredImportableLeases.length === 0 && (
+                  <div className="text-slate-500 text-center py-4 text-[10px]">필터와 일치하는 임대가 없습니다.</div>
                 )}
               </div>
 
