@@ -61,6 +61,10 @@ export default function DhcpServer({
   const [rangeEnd, setRangeEnd] = useState(config.rangeEnd);
   const [subnetMask, setSubnetMask] = useState(config.subnetMask);
   const [gateway, setGateway] = useState(config.gateway);
+  // Optional: leave blank to auto-use whatever real IP the adapter already
+  // has (the default). When set, the backend adds it to the adapter as a
+  // secondary IP so the DHCP server identifies itself with this address.
+  const [serverIp, setServerIp] = useState(config.serverIp || "");
   const [dns, setDns] = useState(config.dns);
   const [leaseTime, setLeaseTime] = useState(config.leaseTime);
 
@@ -201,6 +205,9 @@ export default function DhcpServer({
     setGateway(config.gateway);
   }, [config.gateway]);
   useEffect(() => {
+    setServerIp(config.serverIp || "");
+  }, [config.serverIp]);
+  useEffect(() => {
     setDns(config.dns);
   }, [config.dns]);
   useEffect(() => {
@@ -235,6 +242,9 @@ export default function DhcpServer({
         // handed out here should be the actual router, not this machine.
         setGateway(`${subnetBase}.1`);
         setSubnetMask(selected.netmask || "255.255.255.0");
+        // A custom server IP typed for the previous adapter wouldn't apply
+        // to this one — back to "auto" until the admin sets a new one.
+        setServerIp("");
       }
     }
   };
@@ -254,6 +264,7 @@ export default function DhcpServer({
         rangeEnd,
         subnetMask,
         gateway,
+        serverIp: serverIp.trim(),
         dns,
         leaseTime: Number(leaseTime)
       });
@@ -574,16 +585,16 @@ export default function DhcpServer({
           <div className="flex items-center gap-1.5">
             <span
               className="text-[9px] text-sky-400 bg-sky-950/40 border border-sky-900/40 px-2 py-0.5 rounded font-mono font-bold"
-              title="DHCP 클라이언트에게 이 서버를 식별시키는 주소(옵션 54) — 현재 바인딩 어댑터의 실제 IP이며 직접 수정할 수 없습니다."
+              title="DHCP 클라이언트에게 이 서버를 식별시키는 실제 주소(옵션 54)입니다. 아래 'DHCP 서버 IP'를 비워두면 어댑터의 현재 IP가 그대로 쓰이고, 값을 입력하면 그 IP가 어댑터에 자동으로 추가되어 사용됩니다."
             >
-              서버 IP: {dhcpServerIp || '미지정'}
+              현재 서버 IP: {dhcpServerIp || '미지정'}
             </span>
             <span className="text-[9px] text-indigo-400 bg-indigo-950/40 border border-indigo-900/40 px-2 py-0.5 rounded font-mono font-bold">
               게이트웨이: {gateway || '미지정'}
             </span>
           </div>
         </div>
-        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end text-xs">
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-9 gap-3 items-end text-xs">
           <div>
             <div className="flex items-center justify-between mb-1">
               <label className="block text-slate-400 font-bold text-[10px] truncate">바인딩 어댑터</label>
@@ -644,6 +655,22 @@ export default function DhcpServer({
               onChange={(e) => setSubnetMask(e.target.value)}
               placeholder="255.255.255.0"
               required
+            />
+          </div>
+
+          <div>
+            <label
+              className="block text-slate-400 font-bold mb-1 text-[10px] truncate"
+              title="이 DHCP 서버가 스스로를 식별할 IP입니다. 비워두면 바인딩 어댑터의 현재 IP를 그대로 사용합니다. 값을 입력하면 그 IP가 어댑터에 보조 주소로 자동 추가됩니다 — 어댑터의 기존 기본 IP는 바뀌지 않습니다."
+            >
+              DHCP 서버 IP (선택)
+            </label>
+            <input
+              type="text"
+              className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-sky-500/80 transition"
+              value={serverIp}
+              onChange={(e) => setServerIp(e.target.value)}
+              placeholder="비워두면 자동(어댑터 IP)"
             />
           </div>
 

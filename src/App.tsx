@@ -38,11 +38,14 @@ export default function App() {
     subnetMask: "255.255.255.0",
     gateway: "192.168.1.1",
     dns: "8.8.8.8",
-    leaseTime: 120
+    leaseTime: 120,
+    serverIp: ""
   });
-  // This host's real interface IP, as the DHCP server identifies itself to
-  // clients — computed server-side, not part of DhcpConfig, so it's tracked
-  // as its own piece of state kept in sync from every response that includes it.
+  // This host's real interface IP, as the DHCP server *actually currently*
+  // identifies itself to clients (resolved server-side from dhcpConfig.serverIp
+  // + the adapter's real state) — not itself part of DhcpConfig, so it's
+  // tracked as its own piece of state kept in sync from every response that
+  // includes it.
   const [dhcpServerIp, setDhcpServerIp] = useState("");
 
   const [leases, setLeases] = useState<DhcpLease[]>([]);
@@ -733,7 +736,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.6.0 Enterprise
+                v2.7.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>

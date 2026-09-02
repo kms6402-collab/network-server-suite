@@ -108,7 +108,8 @@ let dhcpConfig: DhcpConfig = {
     ? getSubnetDefaults(initialHostInfo)
     : { rangeStart: "192.168.1.100", rangeEnd: "192.168.1.200", subnetMask: "255.255.255.0", gateway: "192.168.1.1" }),
   dns: "8.8.8.8",
-  leaseTime: 120 // minutes
+  leaseTime: 120, // minutes
+  serverIp: "" // empty = auto (use whatever real IP the adapter already has)
 };
 
 let leases: DhcpLease[] = [];
@@ -202,9 +203,17 @@ function loadState() {
 
       console.log("State restored successfully. AutoStart checks initiating...");
 
-      // Auto-start services if they were running or if configured to always run on boot
+      // Auto-start TFTP/FTP if configured to always run on boot — startServer()
+      // below actually rebinds their real sockets to match these flags. DHCP is
+      // deliberately excluded and always forced back to false here: it has a
+      // real network-conflict risk (a second DHCP server answering on a LAN
+      // that already has one), so it must never come back up silently on
+      // launch — the previous version of this block set dhcpRunning = true
+      // unconditionally and logged "Auto-started DHCP Server", which was
+      // simply false (nothing ever binds the DHCP socket on boot — see
+      // startServer()'s comment) and left the UI showing "가동중" every time
+      // the app launched even though DHCP was never actually listening.
       if (systemStatus.autoStart) {
-        systemStatus.dhcpRunning = true;
         systemStatus.tftpRunning = true;
         systemStatus.ftpRunning = true;
         tftpFtpConfig.tftpEnabled = true;
@@ -212,9 +221,10 @@ function loadState() {
         dhcpConsoleLogs.push({
           timestamp: new Date().toISOString(),
           level: 'SUCCESS',
-          message: 'System recovered from restart. Auto-started DHCP Server.'
+          message: 'System recovered from restart. Auto-started TFTP/FTP servers.'
         });
       }
+      systemStatus.dhcpRunning = false;
     } else if (fs.existsSync(SETTINGS_FILE)) {
       // applet_state.json is missing (fresh install, moved exe without it, the
       // JSON write failed previously, etc.) but the human-readable setting.ini
@@ -232,7 +242,8 @@ function loadState() {
             ...(s.subnetMask && { subnetMask: s.subnetMask }),
             ...(s.gateway && { gateway: s.gateway }),
             ...(s.dns && { dns: s.dns }),
-            ...(s.leaseTime && { leaseTime: Number(s.leaseTime) || dhcpConfig.leaseTime })
+            ...(s.leaseTime && { leaseTime: Number(s.leaseTime) || dhcpConfig.leaseTime }),
+            ...(s.serverIp !== undefined && { serverIp: s.serverIp })
           };
         }
         if (sections.TftpFtpConfig) {
@@ -263,10 +274,10 @@ function loadState() {
           message: `applet_state.json이 없어 설정 파일(${SETTINGS_FILE})에서 설정을 복원했습니다.`
         });
 
-        // Auto-start services if configured to always run on boot, same as the
-        // applet_state.json restore path above.
+        // Auto-start TFTP/FTP if configured to always run on boot, same as the
+        // applet_state.json restore path above. DHCP is deliberately excluded
+        // and always forced back to false — see the comment on that path.
         if (systemStatus.autoStart) {
-          systemStatus.dhcpRunning = true;
           systemStatus.tftpRunning = true;
           systemStatus.ftpRunning = true;
           tftpFtpConfig.tftpEnabled = true;
@@ -274,9 +285,10 @@ function loadState() {
           dhcpConsoleLogs.push({
             timestamp: new Date().toISOString(),
             level: 'SUCCESS',
-            message: 'System recovered from restart. Auto-started DHCP Server.'
+            message: 'System recovered from restart. Auto-started TFTP/FTP servers.'
           });
         }
+        systemStatus.dhcpRunning = false;
       } catch (iniLoadError) {
         console.error("Failed to load setting.ini fallback", iniLoadError);
         dhcpConsoleLogs.push({
@@ -330,7 +342,8 @@ function saveState() {
         subnetMask: dhcpConfig.subnetMask,
         gateway: dhcpConfig.gateway,
         dns: dhcpConfig.dns,
-        leaseTime: String(dhcpConfig.leaseTime)
+        leaseTime: String(dhcpConfig.leaseTime),
+        serverIp: dhcpConfig.serverIp || ""
       },
       TftpFtpConfig: {
         tftpEnabled: String(tftpFtpConfig.tftpEnabled),
@@ -387,7 +400,12 @@ function ensureDhcpConfigMatchesHost(): boolean {
     dhcpConfig = {
       ...dhcpConfig,
       interfaceName: healInterfaceName,
-      ...getSubnetDefaults(healHostInfo)
+      ...getSubnetDefaults(healHostInfo),
+      // A configured serverIp only means something on the adapter it was set
+      // for — if the adapter itself just changed (the old one is gone from
+      // this host), that value is now stale/meaningless, so clear it back to
+      // "auto" rather than carrying it over to an unrelated adapter.
+      ...(fellBackToDefaultInterface ? { serverIp: "" } : {})
     };
     return true;
   }
@@ -594,7 +612,7 @@ function buildDhcpReply(opts: {
 
 function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: string) {
   if (!dhcpSocket) return;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
   if (!hostInfo) return;
 
   const buf = buildDhcpReply({
@@ -673,7 +691,7 @@ function handleDhcpDiscover(pkt: ParsedDhcpPacket) {
 
 function handleDhcpRequest(pkt: ParsedDhcpPacket) {
   const mac = pkt.chaddr;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
   if (!hostInfo) return;
 
   const serverIdOpt = pkt.options.get(54);
@@ -773,7 +791,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
       return;
     }
 
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
     if (!hostInfo) {
       resolve({ success: false, error: `인터페이스 [${dhcpConfig.interfaceName}]를 이 호스트에서 찾을 수 없습니다.` });
       return;
@@ -805,7 +823,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
         // filtered this way — that's covered by confining every reply to
         // the configured subnet's broadcast address instead.
         if (rinfo.address !== "0.0.0.0") {
-          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName);
+          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
           if (currentHost && !isIpInSubnet(rinfo.address, currentHost.ip, dhcpConfig.subnetMask)) {
             return;
           }
@@ -917,23 +935,24 @@ app.post("/api/system/console-log/clear", (req, res) => {
   res.json({ success: true, dhcpConsoleLogs });
 });
 
-// Helper to extract IP and MAC from selected interface name — this host's own
-// real address on that adapter, which the DHCP engine uses both as its
-// option 54/siaddr server identifier and as the source for range/subnet
-// defaults. Just the adapter's first non-internal IPv4 (no "preferred IP"
-// selection anymore): the DHCP server no longer needs to own any particular
-// address on the adapter, since the gateway handed to clients is a separate,
-// independent value (see getSubnetDefaults) instead of something this app
-// has to make the adapter carry. Returns null when the adapter can't be
-// found on this host — callers must handle that explicitly instead of
-// silently falling back to fabricated data.
-function getInterfaceInfo(name: string): { ip: string; mac: string; netmask: string } | null {
+// Helper to extract IP and MAC from selected interface name. An adapter can
+// carry more than one IPv4 address at once (its own DHCP/APIPA-assigned
+// primary, plus a secondary "server IP" alias this app may have added — see
+// ensureServerIpOnAdapter below). When `preferredIp` is given and present
+// among this adapter's addresses, it's returned instead of just "whichever
+// the OS lists first" — the DHCP engine passes dhcpConfig.serverIp here so
+// it consistently identifies itself by the admin's configured address once
+// that alias exists, regardless of what the adapter's primary address is.
+// Returns null when the adapter can't be found on this host — callers must
+// handle that explicitly instead of silently falling back to fabricated data.
+function getInterfaceInfo(name: string, preferredIp?: string): { ip: string; mac: string; netmask: string } | null {
   try {
     const nets = os.networkInterfaces();
     const infos = nets[name];
     if (infos) {
       const ipv4s = infos.filter(info => info.family === "IPv4" && !info.internal);
-      let chosen = ipv4s[0];
+      let chosen = preferredIp ? ipv4s.find(info => info.address === preferredIp) : undefined;
+      if (!chosen) chosen = ipv4s[0];
       if (!chosen) chosen = infos.find(info => info.family === "IPv4");
       if (chosen) {
         return {
@@ -949,15 +968,17 @@ function getInterfaceInfo(name: string): { ip: string; mac: string; netmask: str
   return null;
 }
 
-// The DHCP server's own identifying IP as far as clients are concerned
-// (DHCP option 54/siaddr) — always just the configured adapter's real
-// current IPv4 address, computed fresh rather than stored, so it can never
-// drift out of sync with reality the way a persisted value could. Exposed to
-// the frontend as a read-only "DHCP 서버 IP" field, distinct from the
+// The DHCP server's own identifying IP as far as clients are concerned (DHCP
+// option 54/siaddr). If dhcpConfig.serverIp is set AND currently present on
+// the bound adapter (as its primary address or as an alias this app added —
+// see ensureServerIpOnAdapter), that's what's returned; otherwise falls back
+// to whatever real IP the adapter naturally has. Computed fresh on every
+// call rather than cached, so it can never drift out of sync with reality.
+// Exposed to the frontend as the "서버 IP" badge, distinct from the
 // separately-configurable `dhcpConfig.gateway` clients are told to route
 // through.
 function getCurrentDhcpServerIp(): string {
-  return getInterfaceInfo(dhcpConfig.interfaceName)?.ip || "";
+  return getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp)?.ip || "";
 }
 
 function isValidIPv4(ip: string): boolean {
@@ -992,6 +1013,162 @@ function runPowerShellScript(script: string): Promise<{ success: boolean; stdout
       { encoding: "utf8" },
       (error, stdout, stderr) => {
         resolve({ success: !error, stdout: (stdout || "").trim(), stderr: (stderr || "").trim(), error: error?.message });
+      }
+    );
+  });
+}
+
+// Defensive escaping for values embedded inside PowerShell single-quoted
+// string literals: even though -EncodedCommand removes any shell-injection
+// risk, a literal single quote in the value would still break out of the
+// ' ... ' literal and corrupt the script, so double it per PowerShell's own
+// quoting rules.
+function escapePowerShellSingleQuoted(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+// All non-internal IPv4 addresses currently bound to an adapter (its primary
+// plus any secondary aliases) — used to check whether the configured DHCP
+// server IP is already present before trying to add it again.
+function getAllInterfaceIPv4s(name: string): { ip: string; netmask: string }[] {
+  const nets = os.networkInterfaces();
+  const infos = nets[name];
+  if (!infos) return [];
+  return infos
+    .filter(info => info.family === "IPv4" && !info.internal)
+    .map(info => ({ ip: info.address, netmask: info.netmask }));
+}
+
+// Converts a dotted-decimal subnet mask (e.g. "255.255.255.0") into a CIDR
+// prefix length (e.g. 24), as required by New-NetIPAddress -PrefixLength.
+// Returns null if the mask isn't a well-formed IPv4 dotted-decimal value.
+function subnetMaskToPrefixLength(mask: string): number | null {
+  if (!isValidIPv4(mask)) return null;
+  const octets = mask.split(".").map(Number);
+  let value = 0;
+  for (const o of octets) value = (value << 8) | o;
+  // Force unsigned 32-bit interpretation (the top octet can push the shift
+  // result negative in JS's 32-bit bitwise semantics).
+  value = value >>> 0;
+  let prefix = 0;
+  for (let i = 31; i >= 0; i--) {
+    if ((value & (1 << i)) !== 0) prefix++;
+  }
+  return prefix;
+}
+
+// Tracks the server-IP alias this process last added (if any), so switching
+// dhcpConfig.serverIp to a different address can clean up the old alias
+// instead of leaving it behind on the adapter forever.
+let managedServerIpAlias: { interfaceName: string; ip: string } | null = null;
+
+// Best-effort removal of a server-IP alias from an adapter. Tries the
+// modern PowerShell NetTCPIP cmdlet first (Remove-NetIPAddress), falling back
+// to the legacy netsh command if PowerShell fails for any reason. Never
+// throws — if the IP is already gone (manually removed, adapter changed,
+// etc.) both approaches just fail harmlessly and there's nothing useful to
+// do with that here, so failures are merely logged.
+async function removeServerIpAlias(interfaceName: string, ip: string): Promise<void> {
+  const psScript = `Remove-NetIPAddress -IPAddress '${escapePowerShellSingleQuoted(ip)}' -Confirm:$false -ErrorAction Stop`;
+  const psResult = await runPowerShellScript(psScript);
+  if (psResult.success) {
+    logDhcp("INFO", `DHCP 서버 IP 보조 주소(${ip}) 제거 성공 (PowerShell Remove-NetIPAddress, 어댑터: ${interfaceName}).`);
+    return;
+  }
+  logDhcp("WARN", `DHCP 서버 IP 보조 주소(${ip}) 제거 - PowerShell 방식 실패 (어댑터: ${interfaceName}): ${psResult.stderr || psResult.error || "알 수 없는 오류"}. netsh 방식으로 재시도합니다.`);
+
+  await new Promise<void>((resolve) => {
+    execFile("netsh", ["interface", "ip", "delete", "address", `name=${interfaceName}`, `addr=${ip}`], (error, stdout, stderr) => {
+      if (error) {
+        logDhcp("WARN", `DHCP 서버 IP 보조 주소(${ip}) 제거 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${(stderr && stderr.trim()) || error.message}. (이미 제거되어 있었을 수도 있습니다.)`);
+      } else {
+        logDhcp("INFO", `DHCP 서버 IP 보조 주소(${ip}) 제거 성공 (netsh 폴백, 어댑터: ${interfaceName}).`);
+      }
+      resolve();
+    });
+  });
+}
+
+// Make sure the configured adapter actually has the admin's chosen DHCP
+// server IP available, WITHOUT ever touching whatever primary address it
+// already has (DHCP-obtained, APIPA, or anything else). Rather than
+// replacing the adapter's own "obtain automatically" address with a static
+// one (fragile: Windows keeps fighting to renew/revert it, and every time
+// this app is pointed at a different site/subnet the whole adapter has to be
+// reconfigured), this adds the requested server IP as a *secondary* IP alias
+// on the same adapter — never on any other adapter, so devices reachable
+// only through other interfaces on this machine are completely unaffected.
+// The adapter keeps whatever primary address it wants; the DHCP server
+// identity simply also lives there.
+//
+// Two mechanisms are tried, in order:
+//   1. PowerShell's New-NetIPAddress (NetTCPIP module, Windows 8/Server 2012+).
+//      This is the modern, reliably-supported way to add a secondary static
+//      IP on an adapter that's otherwise getting its primary address via
+//      DHCP — the legacy netsh "interface ip add address" command is known to
+//      fail or behave unpredictably in exactly that situation.
+//   2. The legacy netsh command, kept as a fallback for hosts/environments
+//      where PowerShell or the NetTCPIP module is unavailable.
+// If both fail, the returned error string includes full diagnostic detail
+// from both attempts plus a hint to check for administrator privileges.
+async function ensureServerIpOnAdapter(interfaceName: string, serverIp: string, subnetMask: string): Promise<{ success: boolean; error?: string }> {
+  if (!isValidIPv4(serverIp) || !isValidIPv4(subnetMask)) {
+    return { success: false, error: "DHCP 서버 IP 또는 서브넷 마스크 형식이 올바르지 않습니다." };
+  }
+
+  const currentIps = getAllInterfaceIPv4s(interfaceName);
+  if (currentIps.some(i => i.ip === serverIp)) {
+    // Already present — either the admin set it manually, or we added it in a
+    // previous cycle. Nothing to do.
+    managedServerIpAlias = { interfaceName, ip: serverIp };
+    return { success: true };
+  }
+
+  logDhcp("INFO", `DHCP 서버 IP 보조 주소(${serverIp}/${subnetMask}) 추가 시도 - 어댑터 '${interfaceName}'에 현재 잡혀있는 IPv4 주소: ${currentIps.length > 0 ? currentIps.map(i => `${i.ip} (mask ${i.netmask})`).join(", ") : "(없음)"}`);
+
+  // If we previously added an alias for a *different* address on this same
+  // adapter (the admin changed the configured server IP), remove it first so
+  // aliases don't pile up indefinitely across repeated reconfigurations.
+  if (managedServerIpAlias && managedServerIpAlias.interfaceName === interfaceName && managedServerIpAlias.ip !== serverIp) {
+    await removeServerIpAlias(interfaceName, managedServerIpAlias.ip);
+  }
+
+  const prefixLength = subnetMaskToPrefixLength(subnetMask);
+  let psFailureDetail = "";
+  if (prefixLength === null) {
+    psFailureDetail = `서브넷 마스크(${subnetMask})를 CIDR prefix length로 변환할 수 없습니다.`;
+    logDhcp("WARN", `DHCP 서버 IP 보조 주소 추가 - PowerShell 방식 건너뜀 (어댑터: ${interfaceName}): ${psFailureDetail}`);
+  } else {
+    const psScript = `New-NetIPAddress -InterfaceAlias '${escapePowerShellSingleQuoted(interfaceName)}' -IPAddress '${escapePowerShellSingleQuoted(serverIp)}' -PrefixLength ${prefixLength} -ErrorAction Stop | Out-Null`;
+    const psResult = await runPowerShellScript(psScript);
+    if (psResult.success) {
+      managedServerIpAlias = { interfaceName, ip: serverIp };
+      logDhcp("SUCCESS", `PowerShell(New-NetIPAddress) 방식으로 DHCP 서버 IP 보조 주소(${serverIp}/${prefixLength}) 추가 성공 (어댑터: ${interfaceName}).`);
+      return { success: true };
+    }
+    psFailureDetail = psResult.stderr || psResult.error || "알 수 없는 오류";
+    logDhcp("WARN", `DHCP 서버 IP 보조 주소 추가 - PowerShell(New-NetIPAddress) 방식 실패 (어댑터: ${interfaceName}): ${psFailureDetail}. netsh 방식으로 재시도합니다.`);
+  }
+
+  return new Promise((resolve) => {
+    // execFile (no shell) — args are passed straight to the process, never
+    // interpreted for shell metacharacters, so a malformed or hostile
+    // subnetMask/interfaceName value can't break out into arbitrary command
+    // execution.
+    execFile(
+      "netsh",
+      ["interface", "ip", "add", "address", `name=${interfaceName}`, `addr=${serverIp}`, `mask=${subnetMask}`],
+      (error, stdout, stderr) => {
+        if (error) {
+          const netshFailureDetail = (stderr && stderr.trim()) || error.message;
+          const combinedError = `PowerShell 방식 실패: ${psFailureDetail}. netsh 방식도 실패: ${netshFailureDetail}. 관리자 권한으로 실행 중인지 확인하세요.`;
+          logDhcp("WARN", `DHCP 서버 IP 보조 주소 추가 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${netshFailureDetail}`);
+          resolve({ success: false, error: combinedError });
+        } else {
+          managedServerIpAlias = { interfaceName, ip: serverIp };
+          logDhcp("SUCCESS", `netsh(폴백) 방식으로 DHCP 서버 IP 보조 주소(${serverIp}) 추가 성공 (어댑터: ${interfaceName}).`);
+          resolve({ success: true });
+        }
       }
     );
   });
@@ -1034,7 +1211,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
     // real interface IP the moment the service actually starts, in case it drifted
     // since boot (e.g. this PC's own IP was renewed by the real router's DHCP).
     ensureDhcpConfigMatchesHost();
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
 
     if (!hostInfo) {
       systemStatus.dhcpRunning = false;
@@ -1049,6 +1226,46 @@ app.post("/api/dhcp/toggle", async (req, res) => {
         error: `인터페이스 [${dhcpConfig.interfaceName}]를 찾을 수 없습니다. 유효한 어댑터를 먼저 선택하세요.`,
         systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs
       });
+    }
+
+    // If the admin configured a specific DHCP server IP, make sure the
+    // adapter actually has it — as a secondary alias, never by touching the
+    // adapter's own primary address (see ensureServerIpOnAdapter for why).
+    // An empty serverIp means "auto" (just use whatever the adapter already
+    // has), so nothing to do in that case.
+    if (dhcpConfig.serverIp && hostInfo.ip !== dhcpConfig.serverIp) {
+      const aliasResult = await ensureServerIpOnAdapter(dhcpConfig.interfaceName, dhcpConfig.serverIp, dhcpConfig.subnetMask);
+      if (!aliasResult.success) {
+        systemStatus.dhcpRunning = false;
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'WARN',
+          message: `어댑터에 DHCP 서버 IP(${dhcpConfig.serverIp})를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'} (관리자 권한으로 실행 중인지 확인하세요)`
+        });
+        saveState();
+        return res.json({
+          success: false,
+          error: `어댑터에 DHCP 서버 IP를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`,
+          systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs
+        });
+      }
+
+      const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
+      if (refreshed) hostInfo = refreshed;
+
+      dhcpConsoleLogs.push({
+        timestamp: new Date().toISOString(),
+        level: 'SUCCESS',
+        message: `[자동 조치] 어댑터에 DHCP 서버 IP(${dhcpConfig.serverIp}/${dhcpConfig.subnetMask})를 보조 주소로 추가했습니다. 어댑터의 기존 기본 IP 설정(자동/DHCP 등)은 변경하지 않았습니다.`
+      });
+    } else if (!dhcpConfig.serverIp && managedServerIpAlias && managedServerIpAlias.interfaceName === dhcpConfig.interfaceName) {
+      // The admin cleared the server IP back to "auto" after previously
+      // setting one — remove the now-unwanted alias instead of leaving it on
+      // the adapter forever.
+      await removeServerIpAlias(dhcpConfig.interfaceName, managedServerIpAlias.ip);
+      managedServerIpAlias = null;
+      const refreshed = getInterfaceInfo(dhcpConfig.interfaceName);
+      if (refreshed) hostInfo = refreshed;
     }
 
     // Actually bind the real DHCP socket (port 67). This can fail on
@@ -1129,7 +1346,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
   res.json({ success: true, systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs });
 });
 
-app.post("/api/dhcp/config", (req, res) => {
+app.post("/api/dhcp/config", async (req, res) => {
   const newConfig: DhcpConfig = req.body;
   dhcpConfig = { ...dhcpConfig, ...newConfig };
 
@@ -1141,11 +1358,38 @@ app.post("/api/dhcp/config", (req, res) => {
 
   if (systemStatus.dhcpRunning) {
     // The service is already running and the admin may have just pointed it
-    // at a different adapter — refresh the host-pc-self lease to follow it
-    // immediately instead of requiring a stop/start cycle. Changing `gateway`
-    // alone needs no adapter action: it's just data handed to clients, not
-    // something this host itself has to carry.
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
+    // at a different adapter, or changed the configured server IP — make
+    // sure the new server IP is present on the adapter immediately instead
+    // of requiring a stop/start cycle. Changing `gateway` alone needs no
+    // adapter action: it's just data handed to clients, not something this
+    // host itself has to carry.
+    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
+
+    if (hostInfo && dhcpConfig.serverIp && hostInfo.ip !== dhcpConfig.serverIp) {
+      const aliasResult = await ensureServerIpOnAdapter(dhcpConfig.interfaceName, dhcpConfig.serverIp, dhcpConfig.subnetMask);
+      if (aliasResult.success) {
+        const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
+        if (refreshed) hostInfo = refreshed;
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'SUCCESS',
+          message: `[자동 조치] 어댑터에 새 DHCP 서버 IP(${dhcpConfig.serverIp}/${dhcpConfig.subnetMask})를 보조 주소로 추가했습니다.`
+        });
+      } else {
+        dhcpConsoleLogs.push({
+          timestamp: new Date().toISOString(),
+          level: 'WARN',
+          message: `어댑터에 새 DHCP 서버 IP(${dhcpConfig.serverIp}) 보조 주소를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`
+        });
+      }
+    } else if (hostInfo && !dhcpConfig.serverIp && managedServerIpAlias && managedServerIpAlias.interfaceName === dhcpConfig.interfaceName) {
+      // The admin cleared the server IP back to "auto" — remove the
+      // now-unwanted alias instead of leaving it on the adapter forever.
+      await removeServerIpAlias(dhcpConfig.interfaceName, managedServerIpAlias.ip);
+      managedServerIpAlias = null;
+      const refreshed = getInterfaceInfo(dhcpConfig.interfaceName);
+      if (refreshed) hostInfo = refreshed;
+    }
 
     if (hostInfo) {
       const hostLeaseIdx = leases.findIndex(l => l.id === "host-pc-self" || l.mac === hostInfo.mac);

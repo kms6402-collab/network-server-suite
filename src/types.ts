@@ -6,6 +6,12 @@ export interface DhcpConfig {
   gateway: string;
   dns: string;
   leaseTime: number; // in minutes
+  // Optional: a specific IP the DHCP server should identify itself as
+  // (DHCP option 54/siaddr) on the bound adapter. Empty/unset means "use
+  // whatever real IP the adapter already has" (the default, automatic
+  // behavior). When set, the backend adds it to the adapter as a secondary
+  // IP if not already present — see ensureServerIpOnAdapter in server.ts.
+  serverIp?: string;
 }
 
 export interface DhcpLease {
