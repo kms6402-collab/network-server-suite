@@ -40,6 +40,10 @@ export default function App() {
     dns: "8.8.8.8",
     leaseTime: 120
   });
+  // This host's real interface IP, as the DHCP server identifies itself to
+  // clients — computed server-side, not part of DhcpConfig, so it's tracked
+  // as its own piece of state kept in sync from every response that includes it.
+  const [dhcpServerIp, setDhcpServerIp] = useState("");
 
   const [leases, setLeases] = useState<DhcpLease[]>([]);
   const [reservations, setReservations] = useState<DhcpReservation[]>([]);
@@ -69,6 +73,7 @@ export default function App() {
       
       setStatus(data.systemStatus);
       setDhcpConfig(data.dhcpConfig);
+      setDhcpServerIp(data.dhcpServerIp || "");
       setLeases(data.leases);
       setReservations(data.reservations);
       setTftpFtpConfig(data.tftpFtpConfig);
@@ -129,6 +134,7 @@ export default function App() {
         // reverted server-side in that case, so always resync local state.
         if (data.systemStatus) setStatus(data.systemStatus);
         if (data.dhcpConfig) setDhcpConfig(data.dhcpConfig);
+        if (data.dhcpServerIp !== undefined) setDhcpServerIp(data.dhcpServerIp);
         if (data.leases) setLeases(data.leases);
         if (data.dhcpConsoleLogs) setDhcpConsoleLogs(data.dhcpConsoleLogs);
         if (res.ok && data.success !== false) {
@@ -166,6 +172,7 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (res.ok && data.success !== false) {
         setDhcpConfig(data.dhcpConfig);
+        if (data.dhcpServerIp !== undefined) setDhcpServerIp(data.dhcpServerIp);
         setDhcpConsoleLogs(data.dhcpConsoleLogs);
         return { success: true };
       }
@@ -726,7 +733,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.5.1 Enterprise
+                v2.6.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -818,6 +825,7 @@ export default function App() {
               <DhcpServer
                 dhcpRunning={status.dhcpRunning}
                 config={dhcpConfig}
+                dhcpServerIp={dhcpServerIp}
                 leases={leases}
                 reservations={reservations}
                 terminalHosts={terminalHosts}

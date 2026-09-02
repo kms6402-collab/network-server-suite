@@ -10,6 +10,11 @@ import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
 interface DhcpServerProps {
   dhcpRunning: boolean;
   config: DhcpConfig;
+  // This host's own real interface IP — the address the DHCP server
+  // identifies itself as to clients (option 54), always computed live from
+  // the current adapter rather than stored in DhcpConfig. Shown read-only;
+  // distinct from config.gateway (the router address handed to clients).
+  dhcpServerIp: string;
   leases: DhcpLease[];
   reservations: DhcpReservation[];
   terminalHosts: TerminalHost[];
@@ -26,6 +31,7 @@ interface DhcpServerProps {
 export default function DhcpServer({
   dhcpRunning,
   config,
+  dhcpServerIp,
   leases,
   reservations,
   terminalHosts,
@@ -223,9 +229,11 @@ export default function DhcpServer({
         const subnetBase = `${ipParts[0]}.${ipParts[1]}.${ipParts[2]}`;
         setRangeStart(`${subnetBase}.100`);
         setRangeEnd(`${subnetBase}.200`);
-        // This app is itself the DHCP server, so the gateway it hands out must be
-        // its own real interface IP, not a guessed "x.x.x.1".
-        setGateway(selected.ip);
+        // Just a starting guess (the conventional ".1" of the subnet) —
+        // this server identifies itself to clients separately by its own
+        // real interface IP (shown as "DHCP 서버 IP" below), so the gateway
+        // handed out here should be the actual router, not this machine.
+        setGateway(`${subnetBase}.1`);
         setSubnetMask(selected.netmask || "255.255.255.0");
       }
     }
@@ -563,9 +571,17 @@ export default function DhcpServer({
             </h3>
             <p className="text-[10px] text-slate-400 mt-0.5">IP 대역과 서브넷을 설정합니다.</p>
           </div>
-          <span className="text-[9px] text-indigo-400 bg-indigo-950/40 border border-indigo-900/40 px-2 py-0.5 rounded font-mono font-bold">
-            Gateway/Server: {gateway || '미지정'}
-          </span>
+          <div className="flex items-center gap-1.5">
+            <span
+              className="text-[9px] text-sky-400 bg-sky-950/40 border border-sky-900/40 px-2 py-0.5 rounded font-mono font-bold"
+              title="DHCP 클라이언트에게 이 서버를 식별시키는 주소(옵션 54) — 현재 바인딩 어댑터의 실제 IP이며 직접 수정할 수 없습니다."
+            >
+              서버 IP: {dhcpServerIp || '미지정'}
+            </span>
+            <span className="text-[9px] text-indigo-400 bg-indigo-950/40 border border-indigo-900/40 px-2 py-0.5 rounded font-mono font-bold">
+              게이트웨이: {gateway || '미지정'}
+            </span>
+          </div>
         </div>
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end text-xs">
           <div>
@@ -632,13 +648,18 @@ export default function DhcpServer({
           </div>
 
           <div>
-            <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">기본 게이트웨이</label>
-            <input 
-              type="text" 
+            <label
+              className="block text-slate-400 font-bold mb-1 text-[10px] truncate"
+              title="클라이언트에게 알려줄 실제 네트워크 게이트웨이(라우터) 주소입니다. 이 프로그램이 실행 중인 PC 자신의 주소가 아닙니다 — 그건 위의 '서버 IP'입니다."
+            >
+              기본 게이트웨이
+            </label>
+            <input
+              type="text"
               className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
               value={gateway}
               onChange={(e) => setGateway(e.target.value)}
-              placeholder="192.168.1.1"
+              placeholder="192.168.1.1 (실제 라우터 주소)"
               required
             />
           </div>

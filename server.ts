@@ -78,9 +78,16 @@ function getDefaultInterfaceName(): string {
   return "";
 }
 
-// This app IS the DHCP server, so the gateway it hands out to clients must be its
-// own real interface IP — not a guessed "x.x.x.1". Range/subnet mask are derived
-// from that same real adapter so they always describe a subnet this host is on.
+// Range/subnet mask are derived from the real adapter so they always describe
+// a subnet this host is actually on. `gateway` is just a starting guess
+// (the conventional ".1" of that subnet, like every other DHCP server
+// defaults to) — it is handed to clients as-is via DHCP option 3 (router)
+// and is NOT this server's own address. Do not default it to hostInfo.ip:
+// this app has no IP-forwarding/NAT of its own, so a client using this
+// machine's address as its gateway would be unable to reach anything beyond
+// it. The server identifies itself to clients separately, by its own real
+// interface IP (option 54/siaddr — see getInterfaceInfo/sendDhcpReply),
+// independent of whatever gateway value is configured here.
 function getSubnetDefaults(hostInfo: { ip: string; netmask: string }) {
   const parts = hostInfo.ip.split(".");
   const subnetBase = `${parts[0]}.${parts[1]}.${parts[2]}`;
@@ -88,7 +95,7 @@ function getSubnetDefaults(hostInfo: { ip: string; netmask: string }) {
     rangeStart: `${subnetBase}.100`,
     rangeEnd: `${subnetBase}.200`,
     subnetMask: hostInfo.netmask || "255.255.255.0",
-    gateway: hostInfo.ip
+    gateway: `${subnetBase}.1`
   };
 }
 
@@ -360,18 +367,14 @@ loadState();
 // falling back to a real default adapter (with fresh subnet defaults) in that
 // case. Returns true if the config was changed.
 //
-// NOTE: this deliberately does NOT compare dhcpConfig.gateway against the
-// adapter's current primary IP anymore. Under the gateway-alias model (see
-// ensureGatewayAliasOnAdapter), the Pool's gateway lives on the adapter as a
-// *secondary* IP alias — the adapter's own primary address (DHCP-obtained,
-// APIPA, or anything else) is expected to differ from it as a matter of
-// course, not as a sign of stale/broken config. Treating that normal
-// difference as "stale" used to silently overwrite the admin's saved Pool
-// settings with whatever throwaway address the adapter's primary happened to
-// have (that was the root cause of Pool settings resetting to 169.254.x.x).
+// NOTE: this does NOT compare dhcpConfig.gateway against the adapter's
+// current IP — they are unrelated by design now (see getSubnetDefaults):
+// `gateway` is just the router address handed to clients, independent of
+// whatever real IP this host's adapter carries, so there is nothing to
+// "heal" there even if they happen to differ.
 function ensureDhcpConfigMatchesHost(): boolean {
   let healInterfaceName = dhcpConfig.interfaceName;
-  let healHostInfo = getInterfaceInfo(healInterfaceName, dhcpConfig.gateway);
+  let healHostInfo = getInterfaceInfo(healInterfaceName);
   const fellBackToDefaultInterface = !healHostInfo;
   if (!healHostInfo) {
     healInterfaceName = getDefaultInterfaceName();
@@ -591,7 +594,7 @@ function buildDhcpReply(opts: {
 
 function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: string) {
   if (!dhcpSocket) return;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
   if (!hostInfo) return;
 
   const buf = buildDhcpReply({
@@ -670,7 +673,7 @@ function handleDhcpDiscover(pkt: ParsedDhcpPacket) {
 
 function handleDhcpRequest(pkt: ParsedDhcpPacket) {
   const mac = pkt.chaddr;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
   if (!hostInfo) return;
 
   const serverIdOpt = pkt.options.get(54);
@@ -770,7 +773,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
       return;
     }
 
-    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
     if (!hostInfo) {
       resolve({ success: false, error: `인터페이스 [${dhcpConfig.interfaceName}]를 이 호스트에서 찾을 수 없습니다.` });
       return;
@@ -802,7 +805,7 @@ function startDhcpServer(): Promise<{ success: boolean; error?: string }> {
         // filtered this way — that's covered by confining every reply to
         // the configured subnet's broadcast address instead.
         if (rinfo.address !== "0.0.0.0") {
-          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+          const currentHost = getInterfaceInfo(dhcpConfig.interfaceName);
           if (currentHost && !isIpInSubnet(rinfo.address, currentHost.ip, dhcpConfig.subnetMask)) {
             return;
           }
@@ -895,6 +898,7 @@ app.get("/api/status", (req, res) => {
   res.json({
     systemStatus,
     dhcpConfig,
+    dhcpServerIp: getCurrentDhcpServerIp(),
     leases,
     reservations,
     tftpFtpConfig,
@@ -913,24 +917,23 @@ app.post("/api/system/console-log/clear", (req, res) => {
   res.json({ success: true, dhcpConsoleLogs });
 });
 
-// Helper to extract IP and MAC from selected interface name. An adapter can
-// carry more than one IPv4 address at once (its own DHCP/APIPA-assigned
-// primary, plus a secondary "gateway alias" this app may have added — see
-// ensureGatewayAliasOnAdapter below). When `preferredIp` is given and present
-// among this adapter's addresses, it's returned instead of just "whichever
-// the OS lists first" — every DHCP-engine call site passes dhcpConfig.gateway
-// here so the server consistently identifies itself by its Pool gateway IP
-// once that alias exists, regardless of what the adapter's primary address is.
-// Returns null when the adapter can't be found on this host — callers must handle
-// that explicitly instead of silently falling back to fabricated data.
-function getInterfaceInfo(name: string, preferredIp?: string): { ip: string; mac: string; netmask: string } | null {
+// Helper to extract IP and MAC from selected interface name — this host's own
+// real address on that adapter, which the DHCP engine uses both as its
+// option 54/siaddr server identifier and as the source for range/subnet
+// defaults. Just the adapter's first non-internal IPv4 (no "preferred IP"
+// selection anymore): the DHCP server no longer needs to own any particular
+// address on the adapter, since the gateway handed to clients is a separate,
+// independent value (see getSubnetDefaults) instead of something this app
+// has to make the adapter carry. Returns null when the adapter can't be
+// found on this host — callers must handle that explicitly instead of
+// silently falling back to fabricated data.
+function getInterfaceInfo(name: string): { ip: string; mac: string; netmask: string } | null {
   try {
     const nets = os.networkInterfaces();
     const infos = nets[name];
     if (infos) {
       const ipv4s = infos.filter(info => info.family === "IPv4" && !info.internal);
-      let chosen = preferredIp ? ipv4s.find(info => info.address === preferredIp) : undefined;
-      if (!chosen) chosen = ipv4s[0];
+      let chosen = ipv4s[0];
       if (!chosen) chosen = infos.find(info => info.family === "IPv4");
       if (chosen) {
         return {
@@ -946,16 +949,15 @@ function getInterfaceInfo(name: string, preferredIp?: string): { ip: string; mac
   return null;
 }
 
-// All non-internal IPv4 addresses currently bound to an adapter (its primary
-// plus any secondary aliases) — used to check whether the Pool's gateway IP
-// is already present before trying to add it again.
-function getAllInterfaceIPv4s(name: string): { ip: string; netmask: string }[] {
-  const nets = os.networkInterfaces();
-  const infos = nets[name];
-  if (!infos) return [];
-  return infos
-    .filter(info => info.family === "IPv4" && !info.internal)
-    .map(info => ({ ip: info.address, netmask: info.netmask }));
+// The DHCP server's own identifying IP as far as clients are concerned
+// (DHCP option 54/siaddr) — always just the configured adapter's real
+// current IPv4 address, computed fresh rather than stored, so it can never
+// drift out of sync with reality the way a persisted value could. Exposed to
+// the frontend as a read-only "DHCP 서버 IP" field, distinct from the
+// separately-configurable `dhcpConfig.gateway` clients are told to route
+// through.
+function getCurrentDhcpServerIp(): string {
+  return getInterfaceInfo(dhcpConfig.interfaceName)?.ip || "";
 }
 
 function isValidIPv4(ip: string): boolean {
@@ -963,24 +965,6 @@ function isValidIPv4(ip: string): boolean {
   const parts = ip.split(".");
   if (parts.length !== 4) return false;
   return parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
-}
-
-// Converts a dotted-decimal subnet mask (e.g. "255.255.255.0") into a CIDR
-// prefix length (e.g. 24), as required by New-NetIPAddress -PrefixLength.
-// Returns null if the mask isn't a well-formed IPv4 dotted-decimal value.
-function subnetMaskToPrefixLength(mask: string): number | null {
-  if (!isValidIPv4(mask)) return null;
-  const octets = mask.split(".").map(Number);
-  let value = 0;
-  for (const o of octets) value = (value << 8) | o;
-  // Force unsigned 32-bit interpretation (the top octet can push the shift
-  // result negative in JS's 32-bit bitwise semantics).
-  value = value >>> 0;
-  let prefix = 0;
-  for (let i = 31; i >= 0; i--) {
-    if ((value & (1 << i)) !== 0) prefix++;
-  }
-  return prefix;
 }
 
 // Runs a PowerShell script via -EncodedCommand (Base64 UTF-16LE), so
@@ -1008,131 +992,6 @@ function runPowerShellScript(script: string): Promise<{ success: boolean; stdout
       { encoding: "utf8" },
       (error, stdout, stderr) => {
         resolve({ success: !error, stdout: (stdout || "").trim(), stderr: (stderr || "").trim(), error: error?.message });
-      }
-    );
-  });
-}
-
-// Defensive escaping for values embedded inside PowerShell single-quoted
-// string literals: even though -EncodedCommand removes any shell-injection
-// risk, a literal single quote in the value would still break out of the
-// ' ... ' literal and corrupt the script, so double it per PowerShell's own
-// quoting rules.
-function escapePowerShellSingleQuoted(value: string): string {
-  return value.replace(/'/g, "''");
-}
-
-// Tracks the gateway alias this process last added (if any), so switching the
-// Pool config to a different subnet/site can clean up the old alias instead of
-// leaving it behind on the adapter forever.
-let managedGatewayAlias: { interfaceName: string; ip: string } | null = null;
-
-// Best-effort removal of a gateway alias IP from an adapter. Tries the
-// modern PowerShell NetTCPIP cmdlet first (Remove-NetIPAddress), falling back
-// to the legacy netsh command if PowerShell fails for any reason. Never
-// throws — if the IP is already gone (manually removed, adapter changed,
-// etc.) both approaches just fail harmlessly and there's nothing useful to
-// do with that here, so failures are merely logged.
-async function removeGatewayAlias(interfaceName: string, ip: string): Promise<void> {
-  const psScript = `Remove-NetIPAddress -IPAddress '${escapePowerShellSingleQuoted(ip)}' -Confirm:$false -ErrorAction Stop`;
-  const psResult = await runPowerShellScript(psScript);
-  if (psResult.success) {
-    logDhcp("INFO", `게이트웨이 보조 IP(${ip}) 제거 성공 (PowerShell Remove-NetIPAddress, 어댑터: ${interfaceName}).`);
-    return;
-  }
-  logDhcp("WARN", `게이트웨이 보조 IP(${ip}) 제거 - PowerShell 방식 실패 (어댑터: ${interfaceName}): ${psResult.stderr || psResult.error || "알 수 없는 오류"}. netsh 방식으로 재시도합니다.`);
-
-  await new Promise<void>((resolve) => {
-    execFile("netsh", ["interface", "ip", "delete", "address", `name=${interfaceName}`, `addr=${ip}`], (error, stdout, stderr) => {
-      if (error) {
-        logDhcp("WARN", `게이트웨이 보조 IP(${ip}) 제거 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${(stderr && stderr.trim()) || error.message}. (이미 제거되어 있었을 수도 있습니다.)`);
-      } else {
-        logDhcp("INFO", `게이트웨이 보조 IP(${ip}) 제거 성공 (netsh 폴백, 어댑터: ${interfaceName}).`);
-      }
-      resolve();
-    });
-  });
-}
-
-// Make sure the configured adapter actually has the DHCP Pool's gateway IP
-// available, WITHOUT ever touching whatever primary address it already has
-// (DHCP-obtained, APIPA, or anything else). Rather than replacing the
-// adapter's own "obtain automatically" address with a static one (fragile:
-// Windows keeps fighting to renew/revert it, and every time this app is
-// pointed at a different site/subnet the whole adapter has to be
-// reconfigured), this adds the gateway as a *secondary* IP alias on the same
-// adapter. The adapter keeps whatever primary address it wants; the Pool's
-// gateway simply also lives there. Switching to a different Pool subnet later
-// just swaps which alias is present — the primary is never involved.
-//
-// Two mechanisms are tried, in order:
-//   1. PowerShell's New-NetIPAddress (NetTCPIP module, Windows 8/Server 2012+).
-//      This is the modern, reliably-supported way to add a secondary static
-//      IP on an adapter that's otherwise getting its primary address via
-//      DHCP — the legacy netsh "interface ip add address" command is known to
-//      fail or behave unpredictably in exactly that situation.
-//   2. The legacy netsh command, kept as a fallback for hosts/environments
-//      where PowerShell or the NetTCPIP module is unavailable.
-// If both fail, the returned error string includes full diagnostic detail
-// from both attempts plus a hint to check for administrator privileges.
-async function ensureGatewayAliasOnAdapter(interfaceName: string, gateway: string, subnetMask: string): Promise<{ success: boolean; error?: string }> {
-  if (!isValidIPv4(gateway) || !isValidIPv4(subnetMask)) {
-    return { success: false, error: "게이트웨이 IP 또는 서브넷 마스크 형식이 올바르지 않습니다." };
-  }
-
-  const currentIps = getAllInterfaceIPv4s(interfaceName);
-  if (currentIps.some(i => i.ip === gateway)) {
-    // Already present — either the admin set it manually, or we added it in a
-    // previous cycle. Nothing to do.
-    managedGatewayAlias = { interfaceName, ip: gateway };
-    return { success: true };
-  }
-
-  logDhcp("INFO", `게이트웨이 보조 IP(${gateway}/${subnetMask}) 추가 시도 - 어댑터 '${interfaceName}'에 현재 잡혀있는 IPv4 주소: ${currentIps.length > 0 ? currentIps.map(i => `${i.ip} (mask ${i.netmask})`).join(", ") : "(없음)"}`);
-
-  // If we previously added an alias for a *different* subnet on this same
-  // adapter (the site/deployment changed), remove it first so aliases don't
-  // pile up indefinitely across repeated redeployments.
-  if (managedGatewayAlias && managedGatewayAlias.interfaceName === interfaceName && managedGatewayAlias.ip !== gateway) {
-    await removeGatewayAlias(interfaceName, managedGatewayAlias.ip);
-  }
-
-  const prefixLength = subnetMaskToPrefixLength(subnetMask);
-  let psFailureDetail = "";
-  if (prefixLength === null) {
-    psFailureDetail = `서브넷 마스크(${subnetMask})를 CIDR prefix length로 변환할 수 없습니다.`;
-    logDhcp("WARN", `게이트웨이 보조 IP 추가 - PowerShell 방식 건너뜀 (어댑터: ${interfaceName}): ${psFailureDetail}`);
-  } else {
-    const psScript = `New-NetIPAddress -InterfaceAlias '${escapePowerShellSingleQuoted(interfaceName)}' -IPAddress '${escapePowerShellSingleQuoted(gateway)}' -PrefixLength ${prefixLength} -ErrorAction Stop | Out-Null`;
-    const psResult = await runPowerShellScript(psScript);
-    if (psResult.success) {
-      managedGatewayAlias = { interfaceName, ip: gateway };
-      logDhcp("SUCCESS", `PowerShell(New-NetIPAddress) 방식으로 게이트웨이 보조 IP(${gateway}/${prefixLength}) 추가 성공 (어댑터: ${interfaceName}).`);
-      return { success: true };
-    }
-    psFailureDetail = psResult.stderr || psResult.error || "알 수 없는 오류";
-    logDhcp("WARN", `게이트웨이 보조 IP 추가 - PowerShell(New-NetIPAddress) 방식 실패 (어댑터: ${interfaceName}): ${psFailureDetail}. netsh 방식으로 재시도합니다.`);
-  }
-
-  return new Promise((resolve) => {
-    // execFile (no shell) — args are passed straight to the process, never
-    // interpreted for shell metacharacters, so a malformed or hostile
-    // subnetMask/interfaceName value can't break out into arbitrary command
-    // execution.
-    execFile(
-      "netsh",
-      ["interface", "ip", "add", "address", `name=${interfaceName}`, `addr=${gateway}`, `mask=${subnetMask}`],
-      (error, stdout, stderr) => {
-        if (error) {
-          const netshFailureDetail = (stderr && stderr.trim()) || error.message;
-          const combinedError = `PowerShell 방식 실패: ${psFailureDetail}. netsh 방식도 실패: ${netshFailureDetail}. 관리자 권한으로 실행 중인지 확인하세요.`;
-          logDhcp("WARN", `게이트웨이 보조 IP 추가 - netsh 방식도 실패 (어댑터: ${interfaceName}): ${netshFailureDetail}`);
-          resolve({ success: false, error: combinedError });
-        } else {
-          managedGatewayAlias = { interfaceName, ip: gateway };
-          logDhcp("SUCCESS", `netsh(폴백) 방식으로 게이트웨이 보조 IP(${gateway}) 추가 성공 (어댑터: ${interfaceName}).`);
-          resolve({ success: true });
-        }
       }
     );
   });
@@ -1175,7 +1034,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
     // real interface IP the moment the service actually starts, in case it drifted
     // since boot (e.g. this PC's own IP was renewed by the real router's DHCP).
     ensureDhcpConfigMatchesHost();
-    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
 
     if (!hostInfo) {
       systemStatus.dhcpRunning = false;
@@ -1188,40 +1047,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
       return res.json({
         success: false,
         error: `인터페이스 [${dhcpConfig.interfaceName}]를 찾을 수 없습니다. 유효한 어댑터를 먼저 선택하세요.`,
-        systemStatus, dhcpConfig, leases, dhcpConsoleLogs
-      });
-    }
-
-    // Make sure the Pool's gateway IP is actually reachable on this adapter —
-    // as a secondary alias, never by touching the adapter's own primary
-    // address (see ensureGatewayAliasOnAdapter for why: replacing the
-    // "obtain automatically" primary with a static IP fought Windows
-    // constantly and had to be redone by hand every time this app was pointed
-    // at a different site/subnet).
-    if (hostInfo.ip !== dhcpConfig.gateway) {
-      const aliasResult = await ensureGatewayAliasOnAdapter(dhcpConfig.interfaceName, dhcpConfig.gateway, dhcpConfig.subnetMask);
-      if (!aliasResult.success) {
-        systemStatus.dhcpRunning = false;
-        dhcpConsoleLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'WARN',
-          message: `어댑터에 게이트웨이 보조 IP(${dhcpConfig.gateway})를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'} (관리자 권한으로 실행 중인지 확인하세요)`
-        });
-        saveState();
-        return res.json({
-          success: false,
-          error: `어댑터에 게이트웨이 IP를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`,
-          systemStatus, dhcpConfig, leases, dhcpConsoleLogs
-        });
-      }
-
-      const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
-      if (refreshed) hostInfo = refreshed;
-
-      dhcpConsoleLogs.push({
-        timestamp: new Date().toISOString(),
-        level: 'SUCCESS',
-        message: `[자동 조치] 어댑터에 DHCP Pool 게이트웨이(${dhcpConfig.gateway}/${dhcpConfig.subnetMask})를 보조 IP로 추가했습니다. 어댑터의 기존 기본 IP 설정(자동/DHCP 등)은 변경하지 않았습니다.`
+        systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs
       });
     }
 
@@ -1242,7 +1068,7 @@ app.post("/api/dhcp/toggle", async (req, res) => {
       return res.json({
         success: false,
         error: startResult.error,
-        systemStatus, dhcpConfig, leases, dhcpConsoleLogs
+        systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs
       });
     }
 
@@ -1300,10 +1126,10 @@ app.post("/api/dhcp/toggle", async (req, res) => {
   }
 
   saveState();
-  res.json({ success: true, systemStatus, dhcpConfig, leases, dhcpConsoleLogs });
+  res.json({ success: true, systemStatus, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs });
 });
 
-app.post("/api/dhcp/config", async (req, res) => {
+app.post("/api/dhcp/config", (req, res) => {
   const newConfig: DhcpConfig = req.body;
   dhcpConfig = { ...dhcpConfig, ...newConfig };
 
@@ -1314,30 +1140,12 @@ app.post("/api/dhcp/config", async (req, res) => {
   });
 
   if (systemStatus.dhcpRunning) {
-    let hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
-
-    // The service is already running and the admin just pointed the Pool at a
-    // different gateway/subnet (e.g. redeploying this same box at a different
-    // site) — make sure the new gateway is present on the adapter immediately
-    // instead of requiring a stop/start cycle.
-    if (hostInfo && hostInfo.ip !== dhcpConfig.gateway) {
-      const aliasResult = await ensureGatewayAliasOnAdapter(dhcpConfig.interfaceName, dhcpConfig.gateway, dhcpConfig.subnetMask);
-      if (aliasResult.success) {
-        const refreshed = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
-        if (refreshed) hostInfo = refreshed;
-        dhcpConsoleLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'SUCCESS',
-          message: `[자동 조치] 어댑터에 새 게이트웨이(${dhcpConfig.gateway}/${dhcpConfig.subnetMask})를 보조 IP로 추가했습니다.`
-        });
-      } else {
-        dhcpConsoleLogs.push({
-          timestamp: new Date().toISOString(),
-          level: 'WARN',
-          message: `어댑터에 새 게이트웨이(${dhcpConfig.gateway}) 보조 IP를 추가하지 못했습니다: ${aliasResult.error || '알 수 없는 오류'}`
-        });
-      }
-    }
+    // The service is already running and the admin may have just pointed it
+    // at a different adapter — refresh the host-pc-self lease to follow it
+    // immediately instead of requiring a stop/start cycle. Changing `gateway`
+    // alone needs no adapter action: it's just data handed to clients, not
+    // something this host itself has to carry.
+    const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
 
     if (hostInfo) {
       const hostLeaseIdx = leases.findIndex(l => l.id === "host-pc-self" || l.mac === hostInfo.mac);
@@ -1366,7 +1174,7 @@ app.post("/api/dhcp/config", async (req, res) => {
   }
 
   saveState();
-  res.json({ success: true, dhcpConfig, leases, dhcpConsoleLogs });
+  res.json({ success: true, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs });
 });
 
 // Parse the OS `arp -a` table to discover real devices currently visible on the LAN.
@@ -1495,7 +1303,7 @@ async function pingSweepLeases(): Promise<void> {
 // configured static IP that this DHCP server never issued and never will — the
 // only way to see their IP otherwise is digging through `arp -a` by hand.
 app.get("/api/dhcp/arp-table", async (req, res) => {
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.gateway);
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
   if (!hostInfo) {
     return res.json({ entries: [] });
   }
