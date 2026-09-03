@@ -70,6 +70,15 @@ npm run clean         # dist, server.js, applet_state.json, served_folder 삭제
 - `startServer()`에서 `isPackaged`(= `!!process.pkg`)가 아니고 `NODE_ENV !== "production"`일 때만 Vite 미들웨어 모드(개발 서버)를 쓰고, 그 외에는 `express.static`으로 빌드된 프론트엔드를 서빙한다. 패키징된 exe는 `NODE_ENV` 값과 무관하게 항상 운영 분기를 탄다(과거에는 `NODE_ENV`만으로 분기해서 더블클릭 시 즉시 크래시하는 버그가 있었음 — 이 조건을 다시 `NODE_ENV`만으로 되돌리지 말 것).
 - `__filename`/`__dirname`은 `scriptFilename`/`scriptDirname`이라는 이름으로 `typeof __filename !== "undefined"` 가드를 두어 CJS 번들(pkg/esbuild)과 실제 ESM(tsx dev) 양쪽에서 모두 동작하도록 되어 있다. `import.meta.url`을 직접 다시 쓰지 말 것.
 
+#### 웹 대시보드 로그인 (`server.ts`의 "WEB DASHBOARD LOGIN" 주석 블록)
+
+- `startServer()`가 `app.listen(PORT, "0.0.0.0", ...)`로 바인딩하므로 이 앱의 대시보드는 이 PC뿐 아니라 같은 네트워크의 다른 PC에서도 접속·조작할 수 있다(DHCP 설정, TFTP/FTP 공유 폴더, 저장된 SSH/Telnet 장비 계정까지 전부). 그래서 인증 없이는 아무 `/api/*`도 쓸 수 없다 — `/api/auth/status`·`/api/auth/setup`·`/api/auth/login`·`/api/auth/logout` 4개만 인증 없이 공개되어 있고, 그 4개를 등록한 *바로 다음 줄*에 `app.use("/api", requireAuth)`를 걸어서 그 아래에 정의된(파일 순서상 이후의) 모든 라우트가 자동으로 보호된다 — 새 `/api/*` 라우트를 추가할 때 이 미들웨어보다 위에 쓰면 보호 없이 노출되니 주의.
+- 계정은 딱 1개만 존재할 수 있다(`webAuth: {username, passwordHash, passwordSalt} | null`, 다중 사용자 개념 없음). `webAuth`가 `null`이면(최초 실행이거나 공장 초기화 직후) 프런트엔드는 로그인 폼이 아니라 "관리자 계정 생성" 폼(`Login.tsx`, `configured={false}`)을 보여준다 — 그 외에는 별도 우회 경로 없이 반드시 이 계정 생성을 거쳐야 대시보드에 들어갈 수 있다.
+- 비밀번호는 평문으로 저장/기록되지 않는다 — `crypto.scryptSync(password, salt, 64)` + 계정당 랜덤 salt, 비교는 `crypto.timingSafeEqual`. 이 앱은 TLS가 전혀 없는 순수 HTTP라서 세션 쿠키(`nss_session`)에 `secure` 플래그를 걸지 않는다(걸면 http://로는 브라우저가 쿠키를 아예 안 보냄) — 능동적인 네트워크 도청자를 막으려는 게 아니라 LAN의 아무나가 그냥 접속하는 것만 막는 수준의 보안 모델임을 인지할 것.
+- 세션은 메모리(`webSessions: Map<token, createdAt>`)에만 있고 재시작하면 전부 로그아웃된다(정상 동작). `express`가 `res.cookie()`/`res.clearCookie()`는 기본 제공하지만 들어오는 쿠키 파싱은 `cookie-parser` 없이는 안 해주므로, `parseCookies()`로 `Cookie` 헤더를 직접 2줄짜리로 파싱한다 — 이 때문에 새 의존성이 추가되지 않았다.
+- `POST /api/system/reset`(공장 초기화)은 `webAuth = null; webSessions.clear();`도 함께 수행한다 — 다른 모든 설정처럼 계정도 초기화 대상이고, 이 요청을 보낸 바로 그 세션도 초기화 직후부터는 다시 계정 생성부터 시작해야 한다(라우터 초기화와 동일한 사용자 경험).
+- 프런트엔드 흐름: `App.tsx`가 마운트되자마자 `/api/auth/status`로 `{configured, authenticated}`를 확인해 `authStatus`(`checking`/`setup`/`login`/`ready`)를 정하고, `ready`가 아니면 나머지 폴링(`fetchAllState` 등)을 아예 시작하지 않는다(로그인도 안 된 상태에서 401 나올 게 뻔한 요청들을 쏟아내지 않기 위함). 폴링 중 세션이 만료되면(`/api/status`가 401) 조용히 `checkAuthStatus()`를 다시 불러 로그인 화면으로 돌아간다. `SystemSettings.tsx`에 비밀번호 변경 폼과 로그아웃 버튼이 있고, 헤더에도 로그아웃 아이콘 버튼이 있다.
+
 #### DHCP (실제 어댑터 기반 + 진짜 DHCP 서버, 위험을 인지하고 사용자가 명시적으로 선택)
 
 - `dhcpConfig.interfaceName`의 기본값은 `getDefaultInterfaceName()`이 `os.networkInterfaces()`로 찾은 첫 번째 실제(non-internal) IPv4 어댑터로 자동 설정된다. 서버 기동 시 `loadState()` 이후, 저장된 어댑터가 현재 호스트에 없으면(다른 PC의 설정을 그대로 들고 온 경우 등) 자동으로 실제 어댑터 기준으로 self-heal한다(`ensureDhcpConfigMatchesHost()`, DHCP 토글 on 시점에도 재검증). 이때 어댑터 자체가 바뀌었다면(단순히 게이트웨이만 무효했던 경우가 아니라) `dhcpConfig.serverIp`도 함께 비운다 — 예전 어댑터에서만 의미 있던 값이라 새 어댑터로 그대로 들고 가면 안 되기 때문.
@@ -88,6 +97,12 @@ npm run clean         # dist, server.js, applet_state.json, served_folder 삭제
   - `reservations`(고정 IP 예약)에 있는 MAC은 우선적으로 그 고정 IP를 할당받는다. 리스 만료는 2초 틱커에서 함께 정리된다.
   - `DELETE /api/dhcp/leases/:id` — 개별 리스 삭제(반환). `leases` 배열뿐 아니라 DHCP 서버 내부 임대 추적 구조에서도 함께 제거해서 그 IP가 즉시 재할당 가능한 상태가 된다. `host-pc-self`는 삭제 대상에서 제외.
   - `scanArpTable()`/`discoverNetworkDevices()`(ARP 캐시 기반 보조 탐지)는 그대로 남아있고, 진짜 서버가 이미 발급한 리스(같은 MAC)는 덮어쓰지 않도록 되어 있다 — 정적 IP를 쓰는 기기 등 진짜 서버가 못 잡는 기기를 보조적으로 보여주는 용도.
+  - **MAC 주소는 항상 `normalizeMac()`(대문자 + `:` 구분자)으로 비교해야 한다(중요, 되돌리지 말 것)**: 실제 DHCP 패킷의 `chaddr`은 항상 이 형식으로 정규화되어 저장되지만, 예약 폼이나 CSV 가져오기로 사람이 직접 입력한 MAC은 대소문자/구분자가 제각각일 수 있다. 예전에는 `l.mac === mac` 같은 대소문자 구분 비교를 써서, 사람이 소문자로 입력한 예약이 이미 있던 대문자 리스 레코드를 못 찾아 지우지 못하고 중복으로 남거나(같은 IP/MAC이 목록·CSV 내보내기에 두 번 찍히는 버그의 원인), `handleDhcpRelease`가 반환된 MAC의 기존 레코드를 못 찾아 리스가 초기화되지 않는 버그가 있었다. `upsertLease`/`upsertReservation`/DISCOVER·REQUEST·RELEASE 핸들러/ARP 탐지/`arp-table` 라우트 전부 `normalizeMac()` 비교로 통일되어 있다.
+  - `upsertReservation(mac, ip, hostname)`이 예약 생성·수정·CSV 가져오기의 공통 경로다 — 같은 MAC으로 다시 호출하면(대소문자가 달라도) 기존 예약/리스를 지우고 새로 만들며, 요청한 IP가 *다른* MAC에 이미 예약돼 있으면 `null`을 반환해 호출부가 충돌로 처리한다.
+  - `PUT /api/dhcp/reservations/:id` — 예약 수정(과거엔 삭제 후 재등록만 가능했다). MAC 자체를 바꾸는 경우까지 처리하기 위해, 먼저 기존 MAC의 리스를 정리한 뒤 `upsertReservation`으로 새 값을 반영한다.
+  - `POST /api/dhcp/reservations/bulk-import`(`reservations: {mac,ip,hostname}[]`) — CSV 일괄 등록. 다른 bulk-import들과 같은 패턴으로 프런트엔드(`DhcpServer.tsx`)가 CSV를 직접 파싱해서 평범한 JSON 배열로 보낸다(멀티파트 업로드나 CSV 파싱 의존성 없음). 형식 오류/IP 충돌 행은 건너뛰고 `{imported, skipped}`로 개별 사유를 반환, 한 줄이 잘못됐다고 전체가 실패하지 않는다.
+  - `handleDhcpRelease`는 `status !== 'reserved'`인 리스만 완전히 `splice`로 제거한다(만료 표시가 아니라 배열에서 실제로 삭제) — 반환된 MAC은 즉시 재할당 가능해지고 "할당 단말 현황"에 남지 않는다. 고정 예약은 반환으로 없어지지 않는 게 의도된 동작.
+  - "할당 단말 현황" 테이블(`DhcpServer.tsx`)은 모든 컬럼이 클릭으로 정렬 가능하다(`leaseSortKey`/`leaseSortDir`, IP는 문자열이 아니라 옥텟 단위 숫자로 비교) — 이 정렬은 그리드 뷰와 CSV 내보내기에도 그대로 적용된다(`filteredLeases`가 검색 필터링 + 정렬을 함께 담당).
 
 #### TFTP/FTP (실제 프로토콜 서버, 진짜 DHCP 서버와 동일한 방향성)
 

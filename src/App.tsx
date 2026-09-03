@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
-import { 
-  Activity, Server, Network, FolderOpen, Terminal, Settings, RefreshCw, AlertCircle
+import {
+  Activity, Server, Network, FolderOpen, Terminal, Settings, RefreshCw, AlertCircle, LogOut
 } from 'lucide-react';
 import {
   SystemStatus, DhcpConfig, DhcpLease, DhcpReservation,
@@ -13,12 +13,106 @@ import DhcpServer from './components/DhcpServer';
 import FileServer from './components/FileServer';
 import TerminalAutomation from './components/TerminalAutomation';
 import SystemSettings from './components/SystemSettings';
+import Login from './components/Login';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState<'dashboard' | 'dhcp' | 'files' | 'terminal' | 'settings'>('dashboard');
   const [isLoading, setIsLoading] = useState(true);
   const [isPolling, setIsPolling] = useState(true);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  // Web dashboard login — this app binds to 0.0.0.0, so it's reachable from
+  // anywhere on the LAN, not just this PC. 'checking' is the brief moment
+  // before the first /api/auth/status response comes back; 'setup' means no
+  // admin account exists yet (first run); 'login' means one exists but this
+  // browser has no valid session; 'ready' means the real dashboard can render.
+  const [authStatus, setAuthStatus] = useState<'checking' | 'setup' | 'login' | 'ready'>('checking');
+  const [authUsername, setAuthUsername] = useState('');
+
+  const checkAuthStatus = async () => {
+    try {
+      const res = await fetch('/api/auth/status');
+      const data = await res.json();
+      setAuthUsername(data.username || '');
+      if (!data.configured) setAuthStatus('setup');
+      else if (!data.authenticated) setAuthStatus('login');
+      else setAuthStatus('ready');
+    } catch (e) {
+      console.error(e);
+      // Can't reach the backend at all yet (e.g. still starting up) — try
+      // again shortly rather than getting stuck on a blank screen.
+      setTimeout(checkAuthStatus, 1500);
+    }
+  };
+
+  useEffect(() => {
+    checkAuthStatus();
+  }, []);
+
+  const handleSetupAccount = async (username: string, password: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/auth/setup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        setAuthUsername(data.username || username);
+        setAuthStatus('ready');
+        return { success: true };
+      }
+      return { success: false, error: data.error || '계정 생성에 실패했습니다.' };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '네트워크 오류로 계정을 생성하지 못했습니다.' };
+    }
+  };
+
+  const handleLogin = async (username: string, password: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        setAuthUsername(data.username || username);
+        setAuthStatus('ready');
+        return { success: true };
+      }
+      return { success: false, error: data.error || '로그인에 실패했습니다.' };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '네트워크 오류로 로그인하지 못했습니다.' };
+    }
+  };
+
+  const handleLogout = async () => {
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (e) {
+      console.error(e);
+    }
+    setAuthStatus('login');
+  };
+
+  const handleChangePassword = async (currentPassword: string, newPassword: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/auth/change-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ currentPassword, newPassword })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) return { success: true };
+      return { success: false, error: data.error || '비밀번호 변경에 실패했습니다.' };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '네트워크 오류로 비밀번호를 변경하지 못했습니다.' };
+    }
+  };
 
   // States loaded from backend API
   const [status, setStatus] = useState<SystemStatus>({
@@ -71,6 +165,14 @@ export default function App() {
   const fetchAllState = async () => {
     try {
       const response = await fetch('/api/status');
+      if (response.status === 401) {
+        // Session expired (or was revoked, e.g. a factory reset from another
+        // tab) mid-use — drop back to the login screen instead of showing a
+        // misleading "server unreachable" error.
+        setIsPolling(false);
+        await checkAuthStatus();
+        return;
+      }
       if (!response.ok) throw new Error("서버 연결 불안정");
       const data = await response.json();
       
@@ -110,17 +212,21 @@ export default function App() {
     }
   };
 
-  // Initial load and periodic polling
+  // Initial load and periodic polling — only once actually authenticated,
+  // so a fresh page load doesn't fire a burst of doomed-to-401 requests
+  // while still on the login/setup screen.
   useEffect(() => {
+    if (authStatus !== 'ready') return;
+    setIsPolling(true);
     fetchAllState();
-    
+
     // Set up continuous polling for dynamic updates
     const interval = setInterval(() => {
       if (isPolling) fetchAllState();
     }, 1500);
 
     return () => clearInterval(interval);
-  }, [isPolling]);
+  }, [isPolling, authStatus]);
 
   // Handle service toggling (DHCP, FTP, TFTP)
   const handleToggleService = async (service: 'DHCP' | 'TFTP' | 'FTP', enabled: boolean): Promise<{ success: boolean; error?: string }> => {
@@ -194,15 +300,61 @@ export default function App() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mac, ip, hostname })
       });
+      const data = await res.json().catch(() => ({}));
       if (res.ok) {
-        const data = await res.json();
         setReservations(data.reservations);
         setLeases(data.leases);
         setDhcpConsoleLogs(data.dhcpConsoleLogs);
+      } else {
+        setErrorMsg(data.error || '예약 추가에 실패했습니다.');
       }
     } catch (e) {
       console.error(e);
+      setErrorMsg('네트워크 오류로 예약을 추가하지 못했습니다.');
     }
+  };
+
+  const handleUpdateReservation = async (id: string, mac: string, ip: string, hostname: string): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch(`/api/dhcp/reservations/${id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mac, ip, hostname })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        setReservations(data.reservations);
+        setLeases(data.leases);
+        setDhcpConsoleLogs(data.dhcpConsoleLogs);
+        return { success: true };
+      }
+      return { success: false, error: data.error || '예약 수정에 실패했습니다.' };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '네트워크 오류로 예약을 수정하지 못했습니다.' };
+    }
+  };
+
+  const handleBulkImportReservations = async (rows: { mac: string; ip: string; hostname: string }[]) => {
+    try {
+      const res = await fetch('/api/dhcp/reservations/bulk-import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reservations: rows })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setReservations(data.reservations);
+        setLeases(data.leases);
+        setDhcpConsoleLogs(data.dhcpConsoleLogs);
+        return { imported: data.imported as number, skipped: data.skipped as { row: any; reason: string }[] };
+      }
+      setErrorMsg(data.error || 'CSV 가져오기에 실패했습니다.');
+    } catch (e) {
+      console.error(e);
+      setErrorMsg('네트워크 오류로 CSV를 가져오지 못했습니다.');
+    }
+    return { imported: 0, skipped: [] };
   };
 
   const handleRemoveReservation = async (id: string) => {
@@ -724,6 +876,13 @@ export default function App() {
     }
   };
 
+  if (authStatus === 'checking') {
+    return <div className="min-h-screen" />;
+  }
+  if (authStatus === 'setup' || authStatus === 'login') {
+    return <Login configured={authStatus === 'login'} onSetup={handleSetupAccount} onLogin={handleLogin} />;
+  }
+
   return (
     <div className="min-h-screen text-slate-100 flex flex-col font-sans selection:bg-indigo-500/30 selection:text-white">
       {/* Dynamic Header */}
@@ -736,7 +895,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.7.0 Enterprise
+                v2.8.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -794,6 +953,14 @@ export default function App() {
               설정
             </button>
           </div>
+          <button
+            id="header-logout-btn"
+            onClick={handleLogout}
+            title={`로그아웃 (${authUsername})`}
+            className="p-2 rounded-lg text-slate-400 hover:text-rose-400 hover:bg-rose-950/20 transition cursor-pointer"
+          >
+            <LogOut className="w-4 h-4" />
+          </button>
         </div>
       </header>
 
@@ -835,6 +1002,8 @@ export default function App() {
                 onToggleDhcp={(enabled) => handleToggleService('DHCP', enabled)}
                 onUpdateConfig={handleUpdateDhcpConfig}
                 onAddReservation={handleAddReservation}
+                onUpdateReservation={handleUpdateReservation}
+                onBulkImportReservations={handleBulkImportReservations}
                 onRemoveReservation={handleRemoveReservation}
                 onClearLeases={handleClearLeases}
                 onRemoveLease={handleRemoveLease}
@@ -894,6 +1063,9 @@ export default function App() {
                 onToggleAutoStart={handleToggleAutoStart}
                 onFactoryReset={handleFactoryReset}
                 onRestartService={handleRestartService}
+                authUsername={authUsername}
+                onLogout={handleLogout}
+                onChangePassword={handleChangePassword}
               />
             )}
           </div>

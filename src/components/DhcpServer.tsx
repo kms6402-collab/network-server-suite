@@ -1,9 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   Server, Network, Plus, Trash2, ShieldAlert,
   HelpCircle, RefreshCw, Layers, Check, Database,
   Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
-  Radar, X, AlertCircle, Download
+  Radar, X, AlertCircle, Download, ArrowUp, ArrowDown, ArrowUpDown, Upload, Pencil
 } from 'lucide-react';
 import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
 
@@ -21,6 +21,8 @@ interface DhcpServerProps {
   onToggleDhcp: (enabled: boolean) => Promise<{ success: boolean; error?: string }>;
   onUpdateConfig: (newConfig: DhcpConfig) => Promise<{ success: boolean; error?: string }>;
   onAddReservation: (mac: string, ip: string, hostname: string) => void;
+  onUpdateReservation: (id: string, mac: string, ip: string, hostname: string) => Promise<{ success: boolean; error?: string }>;
+  onBulkImportReservations: (rows: { mac: string; ip: string; hostname: string }[]) => Promise<{ imported: number; skipped: { row: any; reason: string }[] } | void>;
   onRemoveReservation: (id: string) => void;
   onClearLeases: () => void;
   onRemoveLease: (id: string) => void;
@@ -38,6 +40,8 @@ export default function DhcpServer({
   onToggleDhcp,
   onUpdateConfig,
   onAddReservation,
+  onUpdateReservation,
+  onBulkImportReservations,
   onRemoveReservation,
   onClearLeases,
   onRemoveLease,
@@ -71,6 +75,42 @@ export default function DhcpServer({
   // Advanced filters for Leases
   const [searchTerm, setSearchTerm] = useState("");
   const [viewMode, setViewMode] = useState<'grid' | 'table'>('table');
+  // Sortable "할당 단말 현황" list — every column in the table view can be
+  // clicked to sort by it; clicking the same column again flips direction.
+  type LeaseSortKey = 'hostname' | 'ip' | 'mac' | 'interfaceName' | 'leasedAt' | 'status' | 'online';
+  const [leaseSortKey, setLeaseSortKey] = useState<LeaseSortKey | null>(null);
+  const [leaseSortDir, setLeaseSortDir] = useState<'asc' | 'desc'>('asc');
+  const handleLeaseSort = (key: LeaseSortKey) => {
+    if (leaseSortKey === key) {
+      setLeaseSortDir(d => d === 'asc' ? 'desc' : 'asc');
+    } else {
+      setLeaseSortKey(key);
+      setLeaseSortDir('asc');
+    }
+  };
+  // Converts "192.168.1.10" into a single comparable number so IPs sort
+  // numerically per-octet instead of lexicographically (where "...1.10"
+  // would otherwise sort before "...1.9").
+  const ipSortValue = (ip: string): number => {
+    const parts = ip.split('.').map(Number);
+    if (parts.length !== 4 || parts.some(Number.isNaN)) return -1;
+    return ((parts[0] * 256 + parts[1]) * 256 + parts[2]) * 256 + parts[3];
+  };
+  const renderLeaseSortHeader = (key: LeaseSortKey, label: string, extraClassName = "") => (
+    <th
+      className={`p-2.5 cursor-pointer select-none hover:text-white transition ${extraClassName}`}
+      onClick={() => handleLeaseSort(key)}
+    >
+      <span className="inline-flex items-center gap-1">
+        {label}
+        {leaseSortKey === key ? (
+          leaseSortDir === 'asc' ? <ArrowUp className="w-3 h-3" /> : <ArrowDown className="w-3 h-3" />
+        ) : (
+          <ArrowUpDown className="w-3 h-3 opacity-30" />
+        )}
+      </span>
+    </th>
+  );
 
   const getIpStatusMap = () => {
     try {
@@ -253,6 +293,13 @@ export default function DhcpServer({
   const [resMac, setResMac] = useState("");
   const [resIp, setResIp] = useState("");
   const [resHostname, setResHostname] = useState("");
+  // Non-null while editing an existing reservation instead of creating a new
+  // one — the same add-reservation form is reused in-place (matching the
+  // edit pattern used for terminal hosts/scripts elsewhere in this app), so
+  // fixing a typo no longer requires deleting and re-adding the reservation.
+  const [editingReservationId, setEditingReservationId] = useState<string | null>(null);
+  const [resSaving, setResSaving] = useState(false);
+  const [resError, setResError] = useState<string | null>(null);
 
   const handleSaveConfig = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -304,13 +351,137 @@ export default function DhcpServer({
     }
   };
 
-  const handleAddReservation = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!resMac || !resIp || !resHostname) return;
-    onAddReservation(resMac, resIp, resHostname);
+  const resetReservationForm = () => {
     setResMac("");
     setResIp("");
     setResHostname("");
+    setEditingReservationId(null);
+    setResError(null);
+  };
+
+  const handleEditReservationClick = (res: DhcpReservation) => {
+    setEditingReservationId(res.id);
+    setResMac(res.mac);
+    setResIp(res.ip);
+    setResHostname(res.hostname);
+    setResError(null);
+  };
+
+  const handleAddReservation = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!resMac || !resIp || !resHostname) return;
+    setResError(null);
+    if (editingReservationId) {
+      setResSaving(true);
+      try {
+        const result = await onUpdateReservation(editingReservationId, resMac, resIp, resHostname);
+        if (result?.success === false) {
+          setResError(result.error || '예약 수정에 실패했습니다.');
+          return;
+        }
+      } finally {
+        setResSaving(false);
+      }
+    } else {
+      onAddReservation(resMac, resIp, resHostname);
+    }
+    resetReservationForm();
+  };
+
+  // CSV bulk import for static reservations. Parsed entirely client-side
+  // (same "parse in the browser, POST plain JSON" approach as the DHCP-lease
+  // -> terminal-host bulk import elsewhere in this app) so no file-upload
+  // middleware or CSV-parsing dependency is needed on the backend.
+  const csvFileInputRef = useRef<HTMLInputElement>(null);
+  const [csvImportResult, setCsvImportResult] = useState<{ imported: number; skipped: { row: any; reason: string }[] } | null>(null);
+  const [csvImportError, setCsvImportError] = useState<string | null>(null);
+  const [csvImporting, setCsvImporting] = useState(false);
+
+  // Minimal CSV line parser (handles double-quoted fields and "" escaping) —
+  // no dependency needed for the simple flat mac/ip/hostname rows this
+  // feature expects.
+  const parseCsvLine = (line: string): string[] => {
+    const cells: string[] = [];
+    let cur = "";
+    let inQuotes = false;
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (inQuotes) {
+        if (c === '"') {
+          if (line[i + 1] === '"') { cur += '"'; i++; } else { inQuotes = false; }
+        } else {
+          cur += c;
+        }
+      } else if (c === '"') {
+        inQuotes = true;
+      } else if (c === ",") {
+        cells.push(cur);
+        cur = "";
+      } else {
+        cur += c;
+      }
+    }
+    cells.push(cur);
+    return cells.map(c => c.trim());
+  };
+
+  // Accepts a header row naming the mac/ip/hostname columns in Korean or
+  // English (in any order) — falls back to the fixed "hostname,mac,ip" order
+  // (matching the add-reservation form's field order above) when the first
+  // line doesn't look like a recognizable header.
+  const parseReservationCsv = (text: string): { rows: { mac: string; ip: string; hostname: string }[]; error?: string } => {
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+    if (lines.length === 0) return { rows: [], error: "빈 파일입니다." };
+
+    const headerCells = parseCsvLine(lines[0]).map(c => c.toLowerCase());
+    const findCol = (aliases: string[]) => headerCells.findIndex(c => aliases.includes(c));
+    const macCol = findCol(["mac", "mac주소", "mac 주소", "macaddress"]);
+    const ipCol = findCol(["ip", "ip주소", "ip 주소", "고정ip", "고정 ip", "ipaddress"]);
+    const hostnameCol = findCol(["hostname", "호스트명", "name", "이름"]);
+    const hasHeader = macCol !== -1 && ipCol !== -1;
+
+    const dataLines = hasHeader ? lines.slice(1) : lines;
+    const resolvedMacCol = hasHeader ? macCol : 1;
+    const resolvedIpCol = hasHeader ? ipCol : 2;
+    const resolvedHostnameCol = hasHeader ? hostnameCol : 0;
+
+    const rows = dataLines
+      .map(line => {
+        const cells = parseCsvLine(line);
+        return {
+          mac: (cells[resolvedMacCol] || "").trim(),
+          ip: (cells[resolvedIpCol] || "").trim(),
+          hostname: (resolvedHostnameCol !== -1 ? cells[resolvedHostnameCol] : "") || ""
+        };
+      })
+      .filter(r => r.mac || r.ip);
+
+    if (rows.length === 0) return { rows: [], error: "가져올 데이터가 없습니다. mac,ip,hostname 열이 있는지 확인하세요." };
+    return { rows };
+  };
+
+  const handleCsvFileSelected = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = ""; // allow re-selecting the same file later
+    if (!file) return;
+
+    setCsvImportError(null);
+    setCsvImportResult(null);
+
+    const text = await file.text();
+    const { rows, error } = parseReservationCsv(text);
+    if (error) {
+      setCsvImportError(error);
+      return;
+    }
+
+    setCsvImporting(true);
+    try {
+      const result = await onBulkImportReservations(rows);
+      if (result) setCsvImportResult(result);
+    } finally {
+      setCsvImporting(false);
+    }
   };
 
   // Online/offline status indicator derived from the backend's periodic ping
@@ -441,15 +612,38 @@ export default function DhcpServer({
     setNeighborResult(null);
   };
 
-  // Filtered leases based on search term
-  const filteredLeases = leases.filter(lease => {
-    const term = searchTerm.toLowerCase();
-    return (
-      lease.hostname.toLowerCase().includes(term) ||
-      lease.ip.toLowerCase().includes(term) ||
-      lease.mac.toLowerCase().includes(term)
-    );
-  });
+  // Filtered (search) + sorted leases — the table view's clickable column
+  // headers control this, but it also flows into the grid view and the CSV
+  // export below, so all three always agree on ordering.
+  const filteredLeases = leases
+    .filter(lease => {
+      const term = searchTerm.toLowerCase();
+      return (
+        lease.hostname.toLowerCase().includes(term) ||
+        lease.ip.toLowerCase().includes(term) ||
+        lease.mac.toLowerCase().includes(term)
+      );
+    })
+    .sort((a, b) => {
+      if (!leaseSortKey) return 0;
+      let cmp = 0;
+      switch (leaseSortKey) {
+        case 'ip':
+          cmp = ipSortValue(a.ip) - ipSortValue(b.ip);
+          break;
+        case 'leasedAt':
+          cmp = new Date(a.leasedAt).getTime() - new Date(b.leasedAt).getTime();
+          break;
+        case 'online': {
+          const rank = (l: DhcpLease) => l.online === undefined ? 0 : l.online ? 2 : 1;
+          cmp = rank(a) - rank(b);
+          break;
+        }
+        default:
+          cmp = String(a[leaseSortKey]).localeCompare(String(b[leaseSortKey]));
+      }
+      return leaseSortDir === 'asc' ? cmp : -cmp;
+    });
 
   // Standard CSV field escaping: wrap every value in double quotes, and
   // double-up any double quotes already inside the value.
@@ -995,13 +1189,13 @@ export default function DhcpServer({
               <table className="w-full text-left text-xs">
                 <thead className="bg-slate-900/80 border-b border-slate-850 text-slate-300 font-bold text-[10px]">
                   <tr>
-                    <th className="p-2.5 pl-3">단말 호스트명</th>
-                    <th className="p-2.5">임대 IP</th>
-                    <th className="p-2.5">MAC 주소</th>
-                    <th className="p-2.5">인터페이스</th>
-                    <th className="p-2.5">대여 일자</th>
-                    <th className="p-2.5">상태</th>
-                    <th className="p-2.5">온라인</th>
+                    {renderLeaseSortHeader('hostname', '단말 호스트명', 'pl-3')}
+                    {renderLeaseSortHeader('ip', '임대 IP')}
+                    {renderLeaseSortHeader('mac', 'MAC 주소')}
+                    {renderLeaseSortHeader('interfaceName', '인터페이스')}
+                    {renderLeaseSortHeader('leasedAt', '대여 일자')}
+                    {renderLeaseSortHeader('status', '상태')}
+                    {renderLeaseSortHeader('online', '온라인')}
                     <th className="p-2.5 text-right pr-3">관리</th>
                   </tr>
                 </thead>
@@ -1152,21 +1346,72 @@ export default function DhcpServer({
 
         {/* Static Reservations */}
         <div className="p-4 glass-card rounded-xl space-y-4">
-          <div>
-            <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
-              <Database className="w-3.5 h-3.5 text-indigo-400" />
-              고정 IP 예약
-            </h3>
-            <p className="text-[10px] text-slate-400 mt-0.5">MAC 주소별로 항상 동일한 고정 IP를 부여합니다.</p>
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-1.5">
+            <div>
+              <h3 className="text-xs font-display font-bold text-white flex items-center gap-1.5">
+                <Database className="w-3.5 h-3.5 text-indigo-400" />
+                고정 IP 예약
+              </h3>
+              <p className="text-[10px] text-slate-400 mt-0.5">MAC 주소별로 항상 동일한 고정 IP를 부여합니다.</p>
+            </div>
+            <button
+              type="button"
+              id="csv-import-reservations-btn"
+              onClick={() => csvFileInputRef.current?.click()}
+              disabled={csvImporting}
+              className="text-emerald-400 hover:text-emerald-300 text-xs font-bold flex items-center gap-1 cursor-pointer transition disabled:opacity-40 disabled:cursor-not-allowed shrink-0"
+              title="mac,ip,hostname 열(헤더 포함)을 가진 CSV 파일을 선택하세요."
+            >
+              <Upload className={`w-3.5 h-3.5 ${csvImporting ? 'animate-pulse' : ''}`} />
+              {csvImporting ? '가져오는 중...' : 'CSV로 가져오기'}
+            </button>
+            <input
+              ref={csvFileInputRef}
+              type="file"
+              accept=".csv,text/csv"
+              className="hidden"
+              onChange={handleCsvFileSelected}
+            />
           </div>
+
+          {csvImportError && (
+            <div className="text-[10px] text-rose-400 bg-rose-950/30 border border-rose-900/50 rounded-lg px-2.5 py-1.5 flex items-center justify-between gap-2">
+              <span>{csvImportError}</span>
+              <button type="button" onClick={() => setCsvImportError(null)} className="text-slate-400 hover:text-white cursor-pointer">×</button>
+            </div>
+          )}
+          {csvImportResult && (
+            <div className="text-[10px] bg-slate-950/40 border border-slate-850/60 rounded-lg px-2.5 py-1.5 space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-emerald-400 font-bold">
+                  {csvImportResult.imported}건 등록 완료{csvImportResult.skipped.length > 0 ? `, ${csvImportResult.skipped.length}건 건너뜀` : ''}
+                </span>
+                <button type="button" onClick={() => setCsvImportResult(null)} className="text-slate-400 hover:text-white cursor-pointer">×</button>
+              </div>
+              {csvImportResult.skipped.length > 0 && (
+                <ul className="text-slate-400 space-y-0.5 max-h-24 overflow-y-auto">
+                  {csvImportResult.skipped.map((s, i) => (
+                    <li key={i} className="font-mono">
+                      {JSON.stringify(s.row)} — {s.reason}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
 
           <div className="space-y-3">
             {/* Horizontal inline input fields for addition */}
             <form onSubmit={handleAddReservation} className="grid grid-cols-1 sm:grid-cols-4 gap-3 bg-slate-950/40 border border-slate-850/60 p-3 rounded-xl text-xs" id="add-reservation-form">
+              {resError && (
+                <div className="sm:col-span-4 text-[10px] text-rose-400 bg-rose-950/30 border border-rose-900/50 rounded-lg px-2.5 py-1.5">
+                  {resError}
+                </div>
+              )}
               <div>
                 <label className="block text-slate-400 font-bold mb-1 text-[10px]">호스트명</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
                   placeholder="Primary-SQL-DB"
                   value={resHostname}
@@ -1176,8 +1421,8 @@ export default function DhcpServer({
               </div>
               <div>
                 <label className="block text-slate-400 font-bold mb-1 text-[10px]">MAC 주소</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
                   placeholder="AA:BB:CC:DD:EE:FF"
                   value={resMac}
@@ -1187,8 +1432,8 @@ export default function DhcpServer({
               </div>
               <div>
                 <label className="block text-slate-400 font-bold mb-1 text-[10px]">고정 IP</label>
-                <input 
-                  type="text" 
+                <input
+                  type="text"
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
                   placeholder="192.168.1.50"
                   value={resIp}
@@ -1196,14 +1441,25 @@ export default function DhcpServer({
                   required
                 />
               </div>
-              <div className="flex items-end">
+              <div className="flex items-end gap-1.5">
+                {editingReservationId && (
+                  <button
+                    id="cancel-edit-reservation-btn"
+                    type="button"
+                    onClick={resetReservationForm}
+                    className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-bold transition h-[34px] flex items-center justify-center cursor-pointer text-xs"
+                  >
+                    취소
+                  </button>
+                )}
                 <button
                   id="add-reservation-submit"
                   type="submit"
-                  className="w-full py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition shadow h-[34px] flex items-center justify-center gap-1 cursor-pointer text-xs"
+                  disabled={resSaving}
+                  className="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-60 disabled:cursor-not-allowed text-white rounded-lg font-bold transition shadow h-[34px] flex items-center justify-center gap-1 cursor-pointer text-xs"
                 >
-                  <Plus className="w-3.5 h-3.5" />
-                  예약 추가
+                  {editingReservationId ? <Check className="w-3.5 h-3.5" /> : <Plus className="w-3.5 h-3.5" />}
+                  {editingReservationId ? '수정 완료' : '예약 추가'}
                 </button>
               </div>
             </form>
@@ -1229,7 +1485,15 @@ export default function DhcpServer({
                         </span>
                       </td>
                       <td className="p-2.5 font-mono text-slate-400 text-[11px]">{res.mac}</td>
-                      <td className="p-2.5 text-right pr-3">
+                      <td className="p-2.5 text-right pr-3 flex items-center justify-end gap-0.5">
+                        <button
+                          id={`edit-reservation-${res.id}`}
+                          onClick={() => handleEditReservationClick(res)}
+                          className="text-slate-400 hover:text-indigo-400 p-1 rounded transition cursor-pointer"
+                          title="예약 수정"
+                        >
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
                         <button
                           id={`delete-reservation-${res.id}`}
                           onClick={() => onRemoveReservation(res.id)}

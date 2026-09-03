@@ -2,6 +2,7 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import crypto from "crypto";
 import dns from "dns";
 import dgram from "dgram";
 import { exec, execFile, spawn } from "child_process";
@@ -127,6 +128,21 @@ let tftpFtpConfig: TftpFtpConfig = {
 // default, meaning FTP rejects every login until at least one is added.
 let ftpCredentials: FtpCredential[] = [];
 
+// Web dashboard login (see the AUTH section below). This app binds to
+// 0.0.0.0, so its dashboard — DHCP config, TFTP/FTP folder, SSH/Telnet
+// device credentials, everything — is reachable by anyone on the LAN
+// unless gated behind a login. `null` means no account has been created
+// yet; the frontend must show a one-time "create admin account" screen
+// (POST /api/auth/setup) before anything else in that state, since there
+// is deliberately no way to reach any other API without an account existing
+// and a valid session (see requireAuth below).
+interface WebAuthConfig {
+  username: string;
+  passwordHash: string;
+  passwordSalt: string;
+}
+let webAuth: WebAuthConfig | null = null;
+
 let transferLogs: TransferLog[] = [];
 let terminalHosts: TerminalHost[] = [];
 let commandScripts: CommandScript[] = [];
@@ -195,6 +211,7 @@ function loadState() {
       if (data.reservations) reservations = data.reservations;
       if (data.tftpFtpConfig) tftpFtpConfig = { ...tftpFtpConfig, ...data.tftpFtpConfig };
       if (data.ftpCredentials) ftpCredentials = data.ftpCredentials;
+      if (data.webAuth) webAuth = data.webAuth;
       if (data.transferLogs) transferLogs = data.transferLogs;
       if (data.terminalHosts) terminalHosts = data.terminalHosts;
       if (data.commandScripts) commandScripts = data.commandScripts;
@@ -265,6 +282,7 @@ function loadState() {
         if (sections.CommandScripts?.data) commandScripts = JSON.parse(sections.CommandScripts.data);
         if (sections.BatchJobs?.data) batchJobs = JSON.parse(sections.BatchJobs.data);
         if (sections.FtpCredentials?.data) ftpCredentials = JSON.parse(sections.FtpCredentials.data);
+        if (sections.WebAuth?.data) webAuth = JSON.parse(sections.WebAuth.data);
 
         console.log("State restored from setting.ini fallback (applet_state.json not found).");
 
@@ -313,6 +331,7 @@ function saveState() {
       reservations,
       tftpFtpConfig,
       ftpCredentials,
+      webAuth,
       transferLogs,
       terminalHosts,
       commandScripts,
@@ -359,7 +378,8 @@ function saveState() {
       TerminalHosts: { data: JSON.stringify(terminalHosts) },
       CommandScripts: { data: JSON.stringify(commandScripts) },
       BatchJobs: { data: JSON.stringify(batchJobs) },
-      FtpCredentials: { data: JSON.stringify(ftpCredentials) }
+      FtpCredentials: { data: JSON.stringify(ftpCredentials) },
+      WebAuth: { data: JSON.stringify(webAuth) }
     };
     fs.writeFileSync(SETTINGS_FILE, stringifyIni(iniSections), "utf-8");
   } catch (iniError) {
@@ -656,7 +676,7 @@ function findAvailableIp(): string | null {
 // immediately makes that IP available again through findAvailableIp().
 function upsertLease(mac: string, ip: string, hostname: string, status: 'active' | 'reserved'): DhcpLease {
   const now = Date.now();
-  const idx = leases.findIndex(l => l.mac === mac && l.id !== 'host-pc-self');
+  const idx = leases.findIndex(l => normalizeMac(l.mac) === mac && l.id !== 'host-pc-self');
   const record: DhcpLease = {
     id: idx >= 0 ? leases[idx].id : `lease-${now}-${mac.replace(/:/g, "")}`,
     ip,
@@ -673,10 +693,10 @@ function upsertLease(mac: string, ip: string, hostname: string, status: 'active'
 
 function handleDhcpDiscover(pkt: ParsedDhcpPacket) {
   const mac = pkt.chaddr;
-  const reservation = reservations.find(r => r.mac.toUpperCase() === mac);
+  const reservation = reservations.find(r => normalizeMac(r.mac) === mac);
   let offerIp: string | undefined = reservation?.ip;
   if (!offerIp) {
-    const existing = leases.find(l => l.mac === mac && l.status !== 'expired' && l.id !== 'host-pc-self');
+    const existing = leases.find(l => normalizeMac(l.mac) === mac && l.status !== 'expired' && l.id !== 'host-pc-self');
     offerIp = existing?.ip || findAvailableIp() || undefined;
   }
 
@@ -714,10 +734,10 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
     return;
   }
 
-  const reservation = reservations.find(r => r.mac.toUpperCase() === mac);
+  const reservation = reservations.find(r => normalizeMac(r.mac) === mac);
   const isReservedForThisMac = !!reservation && reservation.ip === requestedIp;
   const inRange = isIpInRange(requestedIp, dhcpConfig.rangeStart, dhcpConfig.rangeEnd);
-  const conflict = leases.find(l => l.ip === requestedIp && l.mac !== mac && l.status !== 'expired');
+  const conflict = leases.find(l => l.ip === requestedIp && normalizeMac(l.mac) !== mac && l.status !== 'expired');
 
   if (conflict || (!inRange && !isReservedForThisMac)) {
     logDhcp('WARN', `DHCPREQUEST 거부: MAC ${mac} 가 요청한 IP ${requestedIp} 는 할당할 수 없어 DHCPNAK 전송`);
@@ -736,7 +756,7 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
   // still always wins.
   const hostnameOpt = pkt.options.get(12);
   const parsedHostname = hostnameOpt ? hostnameOpt.toString("utf8").replace(/[^\x20-\x7e]/g, "").trim() : "";
-  const existingLease = leases.find(l => l.mac === mac && l.id !== 'host-pc-self');
+  const existingLease = leases.find(l => normalizeMac(l.mac) === mac && l.id !== 'host-pc-self');
   const hostname = parsedHostname || existingLease?.hostname || `Device-${requestedIp.split(".")[3]}`;
 
   upsertLease(mac, requestedIp, hostname, isReservedForThisMac ? 'reserved' : 'active');
@@ -747,7 +767,11 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
 
 function handleDhcpRelease(pkt: ParsedDhcpPacket) {
   const mac = pkt.chaddr;
-  const idx = leases.findIndex(l => l.mac === mac && l.id !== 'host-pc-self' && l.status !== 'reserved');
+  // Fully drop the lease record (not just mark it expired) so the freed IP
+  // is immediately available again and the released device leaves no stale
+  // row behind in the assigned-device list. A 'reserved' (static) lease is
+  // deliberately left alone — releasing doesn't undo a fixed reservation.
+  const idx = leases.findIndex(l => normalizeMac(l.mac) === mac && l.id !== 'host-pc-self' && l.status !== 'reserved');
   if (idx >= 0) {
     const released = leases[idx];
     leases.splice(idx, 1);
@@ -910,6 +934,161 @@ setInterval(() => {
 }, 2000);
 
 
+/* ============================================================================
+ * WEB DASHBOARD LOGIN
+ * ----------------------------------------------------------------------------
+ * This app binds its HTTP server to 0.0.0.0 (see startServer() below), so the
+ * dashboard is reachable by anyone on the LAN, not just this machine — and it
+ * exposes real control over DHCP/TFTP/FTP and stored SSH/Telnet device
+ * credentials. Every /api/* route except the four below is gated behind a
+ * session cookie (see the app.use("/api", requireAuth) call further down).
+ *
+ * This is plain HTTP with no TLS anywhere in this app, so the session cookie
+ * is not marked `secure` (it has to be sendable over http://) — it is not
+ * designed to resist an active network eavesdropper, only to keep casual LAN
+ * users out without a login. Passwords are never stored or logged in plain
+ * text (scrypt + a random salt per account), unlike the FTP whitelist
+ * credentials elsewhere in this file, which the user's own FTP protocol
+ * requires to keep in a form the server can send back to `ftp-srv`.
+ * ==========================================================================*/
+
+const SESSION_COOKIE = "nss_session";
+const SESSION_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+// In-memory only — a server restart naturally logs everyone out, which is
+// normal session behavior and not worth persisting across restarts.
+const webSessions = new Map<string, number>(); // token -> createdAt (ms)
+
+function hashPassword(password: string, salt: string): string {
+  return crypto.scryptSync(password, salt, 64).toString("hex");
+}
+
+function verifyPassword(password: string, salt: string, expectedHash: string): boolean {
+  const actualHash = Buffer.from(hashPassword(password, salt), "hex");
+  const expected = Buffer.from(expectedHash, "hex");
+  // Constant-time comparison — a plain === would let an attacker measure
+  // response time to guess the hash byte by byte.
+  return actualHash.length === expected.length && crypto.timingSafeEqual(actualHash, expected);
+}
+
+// Express doesn't parse incoming cookies without the `cookie-parser` package
+// (res.cookie()/res.clearCookie() for *sending* cookies are built in, but
+// reading them back is not) — this avoids adding that dependency for what's
+// otherwise a two-line parse of the raw `Cookie` header.
+function parseCookies(header?: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const key = part.slice(0, idx).trim();
+    if (!key) continue;
+    out[key] = decodeURIComponent(part.slice(idx + 1).trim());
+  }
+  return out;
+}
+
+function getSessionToken(req: express.Request): string | undefined {
+  return parseCookies(req.headers.cookie)[SESSION_COOKIE];
+}
+
+function isSessionValid(token: string | undefined): boolean {
+  if (!token) return false;
+  const createdAt = webSessions.get(token);
+  if (createdAt === undefined) return false;
+  if (Date.now() - createdAt > SESSION_MAX_AGE_MS) {
+    webSessions.delete(token);
+    return false;
+  }
+  return true;
+}
+
+function startSession(res: express.Response): void {
+  const token = crypto.randomBytes(32).toString("hex");
+  webSessions.set(token, Date.now());
+  res.cookie(SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: "lax",
+    maxAge: SESSION_MAX_AGE_MS,
+    path: "/"
+  });
+}
+
+// Public — must work with no account and no session yet, since they're how
+// the frontend decides whether to show "create admin account", "log in", or
+// the real dashboard.
+app.get("/api/auth/status", (req, res) => {
+  res.json({
+    configured: !!webAuth,
+    authenticated: isSessionValid(getSessionToken(req)),
+    username: webAuth?.username
+  });
+});
+
+// Only allowed once — this is how the very first admin account gets created,
+// not a general-purpose "add another user" route (this app has exactly one
+// account by design, matching its single-operator local-appliance model).
+app.post("/api/auth/setup", (req, res) => {
+  if (webAuth) {
+    return res.status(400).json({ error: "이미 계정이 설정되어 있습니다." });
+  }
+  const { username, password } = req.body;
+  if (typeof username !== "string" || !username.trim() || typeof password !== "string" || password.length < 4) {
+    return res.status(400).json({ error: "아이디와 4자 이상의 비밀번호를 입력하세요." });
+  }
+  const passwordSalt = crypto.randomBytes(16).toString("hex");
+  webAuth = { username: username.trim(), passwordHash: hashPassword(password, passwordSalt), passwordSalt };
+  saveState();
+  startSession(res);
+  res.json({ success: true, username: webAuth.username });
+});
+
+app.post("/api/auth/login", (req, res) => {
+  const { username, password } = req.body;
+  if (!webAuth || typeof username !== "string" || typeof password !== "string" ||
+      username.trim() !== webAuth.username || !verifyPassword(password, webAuth.passwordSalt, webAuth.passwordHash)) {
+    return res.status(401).json({ error: "아이디 또는 비밀번호가 올바르지 않습니다." });
+  }
+  startSession(res);
+  res.json({ success: true, username: webAuth.username });
+});
+
+app.post("/api/auth/logout", (req, res) => {
+  const token = getSessionToken(req);
+  if (token) webSessions.delete(token);
+  res.clearCookie(SESSION_COOKIE, { path: "/" });
+  res.json({ success: true });
+});
+
+// Everything below this line under /api requires a valid session. Routes
+// registered *above* this point (the four auth routes just defined) already
+// finished handling their own request before Express ever reaches this
+// middleware, so they stay reachable without a session — this line does not
+// need to (and must not) special-case their paths.
+app.use("/api", (req, res, next) => {
+  if (!webAuth) {
+    return res.status(401).json({ error: "AUTH_NOT_CONFIGURED" });
+  }
+  if (!isSessionValid(getSessionToken(req))) {
+    return res.status(401).json({ error: "AUTH_REQUIRED" });
+  }
+  next();
+});
+
+app.post("/api/auth/change-password", (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!webAuth) return res.status(400).json({ error: "설정된 계정이 없습니다." });
+  if (typeof currentPassword !== "string" || !verifyPassword(currentPassword, webAuth.passwordSalt, webAuth.passwordHash)) {
+    return res.status(401).json({ error: "현재 비밀번호가 올바르지 않습니다." });
+  }
+  if (typeof newPassword !== "string" || newPassword.length < 4) {
+    return res.status(400).json({ error: "새 비밀번호는 4자 이상이어야 합니다." });
+  }
+  const passwordSalt = crypto.randomBytes(16).toString("hex");
+  webAuth = { ...webAuth, passwordHash: hashPassword(newPassword, passwordSalt), passwordSalt };
+  saveState();
+  res.json({ success: true });
+});
+
 /* --- SYSTEM API ENDPOINTS --- */
 
 app.get("/api/status", (req, res) => {
@@ -986,6 +1165,25 @@ function isValidIPv4(ip: string): boolean {
   const parts = ip.split(".");
   if (parts.length !== 4) return false;
   return parts.every(p => /^\d{1,3}$/.test(p) && Number(p) >= 0 && Number(p) <= 255);
+}
+
+// Every MAC coming off the wire (DHCPDISCOVER/REQUEST/RELEASE chaddr, arp -a)
+// is already normalized to this exact "AA:BB:CC:DD:EE:FF" uppercase form —
+// but a MAC typed by hand into the reservation form (or a CSV bulk import)
+// can be any case/separator the user happened to type. Comparing those two
+// case-sensitively (`===`) was the actual bug behind reservations leaving a
+// duplicate/orphaned lease entry behind: `"aa:bb:..." !== "AA:BB:..."`, so
+// the old dynamic lease for that MAC never got cleaned up when the
+// reservation replaced it, and a real DHCPRELEASE for that MAC later never
+// matched it either. Use this for every reservation/lease MAC comparison —
+// both to normalize new input at the door and, defensively, to compare
+// existing values that may predate this fix.
+function normalizeMac(mac: string): string {
+  return mac.trim().toUpperCase().replace(/-/g, ":");
+}
+
+function isValidMac(mac: string): boolean {
+  return /^[0-9A-F]{2}(:[0-9A-F]{2}){5}$/.test(normalizeMac(mac));
 }
 
 // Runs a PowerShell script via -EncodedCommand (Base64 UTF-16LE), so
@@ -1483,7 +1681,7 @@ async function discoverNetworkDevices(): Promise<boolean> {
     // authoritative — the real DHCP server's own record for a device is
     // always more trustworthy than a possibly-stale ARP cache entry, so
     // skip it entirely rather than overwriting its IP.
-    const existing = leases.find(l => l.mac === device.mac && l.status !== 'expired');
+    const existing = leases.find(l => normalizeMac(l.mac) === normalizeMac(device.mac) && l.status !== 'expired');
     if (existing) continue;
 
     const hostname = (await reverseDnsLookup(device.ip)) || `Device-${device.ip.split(".")[3]}`;
@@ -1557,8 +1755,8 @@ app.get("/api/dhcp/arp-table", async (req, res) => {
   const entries = found
     .filter(d => d.ip.startsWith(subnetPrefix))
     .map(d => {
-      const reservation = reservations.find(r => r.mac === d.mac);
-      const lease = leases.find(l => l.mac === d.mac);
+      const reservation = reservations.find(r => normalizeMac(r.mac) === normalizeMac(d.mac));
+      const lease = leases.find(l => normalizeMac(l.mac) === normalizeMac(d.mac));
       let matched: 'lease' | 'reservation' | 'unmanaged' = 'unmanaged';
       if (reservation) matched = 'reservation';
       else if (lease) matched = 'lease';
@@ -1578,23 +1776,26 @@ app.post("/api/dhcp/discover", async (req, res) => {
 });
 
 // Reservations
-app.post("/api/dhcp/reservations", (req, res) => {
-  const { mac, ip, hostname } = req.body;
-  if (!mac || !ip || !hostname) {
-    return res.status(400).json({ error: "Missing required fields" });
-  }
-  
-  const id = "res-" + Date.now();
-  const newRes: DhcpReservation = { id, mac, ip, hostname };
+// Creates or replaces the reservation for a MAC (re-adding an already-
+// reserved MAC with a new IP updates it in place instead of creating a
+// second, conflicting entry) and mirrors the change into `leases` as a
+// permanent 'reserved' record — replacing whatever dynamic/stale lease that
+// MAC held before under any casing/separator it was originally stored with.
+// This is also what lets a currently-active real DHCP lease "upgrade"
+// cleanly into a static reservation. Returns null if the requested IP is
+// already reserved by a *different* MAC.
+function upsertReservation(rawMac: string, ip: string, hostname: string): DhcpReservation | null {
+  const mac = normalizeMac(rawMac);
+  const ipConflict = reservations.find(r => normalizeMac(r.mac) !== mac && r.ip === ip);
+  if (ipConflict) return null;
+
+  reservations = reservations.filter(r => normalizeMac(r.mac) !== mac);
+  const newRes: DhcpReservation = { id: "res-" + Date.now() + "-" + mac.replace(/:/g, ""), mac, ip, hostname };
   reservations.push(newRes);
 
-  // Replace any existing lease already held by this MAC (dynamic or stale)
-  // with the new permanent reserved lease, instead of leaving a duplicate
-  // row behind — this is also what lets a currently-active real DHCP lease
-  // "upgrade" cleanly into a static reservation.
-  leases = leases.filter(l => l.mac !== mac || l.id === "host-pc-self");
+  leases = leases.filter(l => normalizeMac(l.mac) !== mac || l.id === "host-pc-self");
   leases.push({
-    id: "lease-res-" + Date.now(),
+    id: "lease-res-" + Date.now() + "-" + mac.replace(/:/g, ""),
     ip,
     mac,
     hostname,
@@ -1603,13 +1804,132 @@ app.post("/api/dhcp/reservations", (req, res) => {
     expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365).toISOString(), // 1 year
     status: 'reserved'
   });
+  return newRes;
+}
+
+app.post("/api/dhcp/reservations", (req, res) => {
+  const { mac, ip, hostname } = req.body;
+  if (!mac || !ip || !hostname) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!isValidMac(mac)) {
+    return res.status(400).json({ error: "MAC 주소 형식이 올바르지 않습니다 (예: AA:BB:CC:DD:EE:FF)." });
+  }
+  if (!isValidIPv4(ip)) {
+    return res.status(400).json({ error: "IP 주소 형식이 올바르지 않습니다." });
+  }
+
+  const newRes = upsertReservation(mac, ip, hostname);
+  if (!newRes) {
+    return res.status(400).json({ error: `IP ${ip}는 이미 다른 MAC 주소로 예약되어 있습니다.` });
+  }
 
   dhcpConsoleLogs.push({
     timestamp: new Date().toISOString(),
     level: 'SUCCESS',
-    message: `Static reservation bound: MAC ${mac} to IP ${ip}`
+    message: `Static reservation bound: MAC ${newRes.mac} to IP ${ip}`
   });
 
+  saveState();
+  res.json({ success: true, reservations, leases, dhcpConsoleLogs });
+});
+
+// Bulk-register static reservations from a CSV file the frontend has already
+// parsed client-side into rows (same "parse in the browser, POST plain
+// JSON" pattern as /api/hosts/bulk-import) — no multipart/file-upload
+// handling or new dependency needed on this end. Invalid rows (bad MAC/IP
+// format) and IP conflicts with a different MAC are counted and skipped
+// rather than aborting the whole batch, so one bad line in a large CSV
+// doesn't block the rest.
+app.post("/api/dhcp/reservations/bulk-import", (req, res) => {
+  const { reservations: rows } = req.body;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return res.status(400).json({ error: "가져올 예약 목록이 없습니다." });
+  }
+
+  let imported = 0;
+  const skipped: { row: any; reason: string }[] = [];
+
+  for (const row of rows) {
+    const mac = typeof row?.mac === "string" ? row.mac : "";
+    const ip = typeof row?.ip === "string" ? row.ip : "";
+    const hostname = typeof row?.hostname === "string" && row.hostname.trim() ? row.hostname.trim() : mac;
+
+    if (!mac || !ip) {
+      skipped.push({ row, reason: "MAC 또는 IP 누락" });
+      continue;
+    }
+    if (!isValidMac(mac)) {
+      skipped.push({ row, reason: "MAC 주소 형식 오류" });
+      continue;
+    }
+    if (!isValidIPv4(ip)) {
+      skipped.push({ row, reason: "IP 주소 형식 오류" });
+      continue;
+    }
+    const result = upsertReservation(mac, ip, hostname);
+    if (!result) {
+      skipped.push({ row, reason: `IP ${ip}가 다른 MAC에 이미 예약됨` });
+      continue;
+    }
+    imported++;
+  }
+
+  dhcpConsoleLogs.push({
+    timestamp: new Date().toISOString(),
+    level: 'SUCCESS',
+    message: `CSV 일괄 등록: ${imported}건 등록, ${skipped.length}건 건너뜀`
+  });
+
+  saveState();
+  res.json({ success: true, reservations, leases, dhcpConsoleLogs, imported, skipped });
+});
+
+// Edit an existing reservation in place (previously the only way to change
+// one was delete + re-add, which briefly frees the IP and drops the lease
+// record). Handles the MAC itself being changed by clearing whatever lease
+// the *old* MAC held before delegating to upsertReservation for the actual
+// write with the new values.
+app.put("/api/dhcp/reservations/:id", (req, res) => {
+  const { id } = req.params;
+  const existing = reservations.find(r => r.id === id);
+  if (!existing) {
+    return res.status(404).json({ error: "예약 정보를 찾을 수 없습니다." });
+  }
+
+  const { mac, ip, hostname } = req.body;
+  if (!mac || !ip || !hostname) {
+    return res.status(400).json({ error: "Missing required fields" });
+  }
+  if (!isValidMac(mac)) {
+    return res.status(400).json({ error: "MAC 주소 형식이 올바르지 않습니다 (예: AA:BB:CC:DD:EE:FF)." });
+  }
+  if (!isValidIPv4(ip)) {
+    return res.status(400).json({ error: "IP 주소 형식이 올바르지 않습니다." });
+  }
+
+  const newMac = normalizeMac(mac);
+  const ipConflict = reservations.find(r => r.id !== id && normalizeMac(r.mac) !== newMac && r.ip === ip);
+  if (ipConflict) {
+    return res.status(400).json({ error: `IP ${ip}는 이미 다른 MAC 주소로 예약되어 있습니다.` });
+  }
+
+  reservations = reservations.filter(r => r.id !== id);
+  leases = leases.filter(l => normalizeMac(l.mac) !== normalizeMac(existing.mac) || l.id === "host-pc-self");
+
+  const updated = upsertReservation(mac, ip, hostname);
+  if (!updated) {
+    // Already checked for conflicts above, but restore rather than silently
+    // dropping the entry if something still went wrong.
+    reservations.push(existing);
+    return res.status(400).json({ error: `IP ${ip}는 이미 다른 MAC 주소로 예약되어 있습니다.` });
+  }
+
+  dhcpConsoleLogs.push({
+    timestamp: new Date().toISOString(),
+    level: 'SUCCESS',
+    message: `Reservation updated: MAC ${updated.mac} → IP ${ip}`
+  });
   saveState();
   res.json({ success: true, reservations, leases, dhcpConsoleLogs });
 });
@@ -1619,8 +1939,9 @@ app.delete("/api/dhcp/reservations/:id", (req, res) => {
   const resToDelete = reservations.find(r => r.id === id);
   if (resToDelete) {
     reservations = reservations.filter(r => r.id !== id);
-    // Remove static lease status
-    leases = leases.filter(l => l.mac !== resToDelete.mac);
+    // Remove static lease status — normalized comparison so this still
+    // matches a lease whose MAC predates the case-normalization fix above.
+    leases = leases.filter(l => normalizeMac(l.mac) !== normalizeMac(resToDelete.mac));
     dhcpConsoleLogs.push({
       timestamp: new Date().toISOString(),
       level: 'INFO',
@@ -3480,6 +3801,11 @@ app.post("/api/system/reset", async (req, res) => {
   transferLogs = [];
   terminalHosts = [];
   commandScripts = [];
+  // Factory reset wipes the admin account too, same as a router reset —
+  // every session (including the one making this very request) ends, and
+  // the next page load must go through account setup again.
+  webAuth = null;
+  webSessions.clear();
   dhcpConsoleLogs = [
     { timestamp: new Date().toISOString(), level: 'INFO', message: "System configurations factory reset by administrator." }
   ];

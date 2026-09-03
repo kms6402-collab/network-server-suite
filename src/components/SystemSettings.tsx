@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 import {
   Settings, Power, RefreshCw, Trash2, ShieldCheck,
-  BookOpen, Info, Cpu, HardDrive, Network, RotateCcw
+  BookOpen, Info, Cpu, HardDrive, Network, RotateCcw,
+  KeyRound, LogOut, Check, AlertCircle
 } from 'lucide-react';
 import { SystemStatus } from '../types';
 
@@ -10,15 +11,51 @@ interface SystemSettingsProps {
   onToggleAutoStart: (enabled: boolean) => void;
   onFactoryReset: () => void;
   onRestartService: () => void;
+  authUsername: string;
+  onLogout: () => void;
+  onChangePassword: (currentPassword: string, newPassword: string) => Promise<{ success: boolean; error?: string }>;
 }
 
 export default function SystemSettings({
   status,
   onToggleAutoStart,
   onFactoryReset,
-  onRestartService
+  onRestartService,
+  authUsername,
+  onLogout,
+  onChangePassword
 }: SystemSettingsProps) {
   const [isRestarting, setIsRestarting] = useState(false);
+
+  // Change-password form
+  const [currentPassword, setCurrentPassword] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmNewPassword, setConfirmNewPassword] = useState('');
+  const [pwFeedback, setPwFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [pwSaving, setPwSaving] = useState(false);
+
+  const handleChangePasswordSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setPwFeedback(null);
+    if (newPassword !== confirmNewPassword) {
+      setPwFeedback({ type: 'error', message: '새 비밀번호가 일치하지 않습니다.' });
+      return;
+    }
+    setPwSaving(true);
+    try {
+      const result = await onChangePassword(currentPassword, newPassword);
+      if (result.success) {
+        setPwFeedback({ type: 'success', message: '비밀번호가 변경되었습니다.' });
+        setCurrentPassword('');
+        setNewPassword('');
+        setConfirmNewPassword('');
+      } else {
+        setPwFeedback({ type: 'error', message: result.error || '비밀번호 변경에 실패했습니다.' });
+      }
+    } finally {
+      setPwSaving(false);
+    }
+  };
 
   const handleRestartClick = () => {
     if (!window.confirm("서비스를 재시작하시겠습니까? 잠시 접속이 끊깁니다.")) return;
@@ -154,6 +191,77 @@ export default function SystemSettings({
               </div>
             </div>
           </div>
+        </div>
+      </div>
+
+      {/* Web dashboard login account */}
+      <div className="p-5 bg-slate-900/40 border border-slate-800 rounded-xl space-y-4">
+        <h3 className="text-sm font-display font-semibold text-white border-b border-slate-850 pb-2 flex items-center gap-2">
+          <KeyRound className="w-4 h-4 text-sky-400" />
+          관리자 계정
+        </h3>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 text-xs">
+          <div className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl flex items-center justify-between">
+            <div>
+              <div className="font-semibold text-white">{authUsername || '(알 수 없음)'}</div>
+              <div className="text-[10px] text-slate-400 mt-1">현재 로그인된 계정입니다.</div>
+            </div>
+            <button
+              id="settings-logout-btn"
+              onClick={onLogout}
+              className="px-3 py-2 bg-slate-800 hover:bg-rose-950/40 hover:text-rose-300 text-slate-300 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition shrink-0 cursor-pointer"
+            >
+              <LogOut className="w-3.5 h-3.5" />
+              로그아웃
+            </button>
+          </div>
+
+          <form onSubmit={handleChangePasswordSubmit} className="p-4 bg-slate-950/60 border border-slate-800 rounded-xl space-y-2.5" id="change-password-form">
+            <span className="font-semibold text-white block">비밀번호 변경</span>
+            {pwFeedback && (
+              <div className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg text-[10px] ${pwFeedback.type === 'success' ? 'text-emerald-400 bg-emerald-950/20 border border-emerald-900/40' : 'text-rose-400 bg-rose-950/20 border border-rose-900/40'}`}>
+                {pwFeedback.type === 'success' ? <Check className="w-3.5 h-3.5 shrink-0" /> : <AlertCircle className="w-3.5 h-3.5 shrink-0" />}
+                <span>{pwFeedback.message}</span>
+              </div>
+            )}
+            <input
+              type="password"
+              className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-sky-500 transition"
+              placeholder="현재 비밀번호"
+              value={currentPassword}
+              onChange={(e) => setCurrentPassword(e.target.value)}
+              required
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <input
+                type="password"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-sky-500 transition"
+                placeholder="새 비밀번호 (4자 이상)"
+                value={newPassword}
+                onChange={(e) => setNewPassword(e.target.value)}
+                minLength={4}
+                required
+              />
+              <input
+                type="password"
+                className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-sky-500 transition"
+                placeholder="새 비밀번호 확인"
+                value={confirmNewPassword}
+                onChange={(e) => setConfirmNewPassword(e.target.value)}
+                minLength={4}
+                required
+              />
+            </div>
+            <button
+              id="change-password-submit"
+              type="submit"
+              disabled={pwSaving}
+              className="w-full py-2 bg-sky-600 hover:bg-sky-500 disabled:opacity-60 disabled:cursor-not-allowed text-white rounded-lg font-bold transition text-xs cursor-pointer"
+            >
+              {pwSaving ? '변경 중...' : '비밀번호 변경'}
+            </button>
+          </form>
         </div>
       </div>
 
