@@ -207,7 +207,14 @@ function loadState() {
       const data = JSON.parse(fs.readFileSync(STATE_FILE, "utf-8"));
       if (data.systemStatus) systemStatus = { ...systemStatus, ...data.systemStatus };
       if (data.dhcpConfig) dhcpConfig = { ...dhcpConfig, ...data.dhcpConfig };
-      if (data.leases) leases = data.leases;
+      if (data.leases) {
+        leases = data.leases;
+        // Clean up any duplicate rows already sitting in a state file saved
+        // before the discoverNetworkDevices() duplicate-spawning bug was
+        // fixed, so upgrading and restarting clears them immediately instead
+        // of waiting on the next natural save.
+        dedupeLeases();
+      }
       if (data.reservations) reservations = data.reservations;
       if (data.tftpFtpConfig) tftpFtpConfig = { ...tftpFtpConfig, ...data.tftpFtpConfig };
       if (data.ftpCredentials) ftpCredentials = data.ftpCredentials;
@@ -798,6 +805,51 @@ function expireLeases() {
   if (changed || leases.length !== beforeCount) saveState();
 }
 
+// Collapses lease rows that share the same normalized (MAC, IP) pair down to
+// a single entry. The root cause of duplicates was discoverNetworkDevices()
+// respawning a fresh "Device-X" row every time an ARP-only-tracked device's
+// pseudo-lease expired (fixed above), but this also self-heals any
+// duplicates already sitting in persisted state from before that fix, and
+// is a backstop against any other path that might ever create one. Two
+// entries with the same IP but a *different* MAC are left alone — that's a
+// real conflict/anomaly worth surfacing, not a duplicate to hide.
+function dedupeLeases(): boolean {
+  const bestByKey = new Map<string, DhcpLease>();
+  const isGenericHostname = (l: DhcpLease) => /^Device-\d+$/.test(l.hostname);
+  const statusRank = (l: DhcpLease) => l.status === 'reserved' ? 2 : l.status === 'active' ? 1 : 0;
+
+  for (const lease of leases) {
+    if (lease.id === 'host-pc-self') continue;
+    const key = `${normalizeMac(lease.mac)}|${lease.ip}`;
+    const existing = bestByKey.get(key);
+    if (!existing) {
+      bestByKey.set(key, lease);
+      continue;
+    }
+    // Prefer (in order): reserved > active > expired, then a real hostname
+    // over a generic "Device-N" one, then whichever was leased more recently.
+    let winner = existing;
+    if (statusRank(lease) !== statusRank(existing)) {
+      winner = statusRank(lease) > statusRank(existing) ? lease : existing;
+    } else if (isGenericHostname(existing) !== isGenericHostname(lease)) {
+      winner = isGenericHostname(existing) ? lease : existing;
+    } else if (new Date(lease.leasedAt).getTime() > new Date(existing.leasedAt).getTime()) {
+      winner = lease;
+    }
+    bestByKey.set(key, winner);
+  }
+
+  const beforeCount = leases.length;
+  const keepIds = new Set(Array.from(bestByKey.values()).map(l => l.id));
+  leases = leases.filter(l => l.id === 'host-pc-self' || keepIds.has(l.id));
+  const removed = beforeCount - leases.length;
+  if (removed > 0) {
+    logDhcp('INFO', `중복된 임대 항목 ${removed}건을 정리했습니다.`);
+    return true;
+  }
+  return false;
+}
+
 function describeSocketBindError(err: NodeJS.ErrnoException): string {
   if (err.code === "EACCES") {
     return "DHCP 서버 포트(67) 바인딩 실패 — 관리자 권한으로 실행하거나 다른 DHCP 서버와의 포트 충돌을 확인하세요. (권한 부족: EACCES)";
@@ -890,9 +942,13 @@ setInterval(() => {
   // Update uptime
   systemStatus.uptime += 2;
 
-  // Reclaim expired dynamic leases so their IPs become available again.
+  // Reclaim expired dynamic leases so their IPs become available again, and
+  // collapse any duplicate rows a still-in-progress scan cycle might have
+  // left behind (see dedupeLeases() — mainly a backstop now that the actual
+  // duplicate-spawning bug in discoverNetworkDevices() is fixed).
   if (systemStatus.dhcpRunning) {
     expireLeases();
+    if (dedupeLeases()) saveState();
   }
 
   // Periodically (every ~4s) scan the LAN for real devices while DHCP is running.
@@ -1676,13 +1732,33 @@ async function discoverNetworkDevices(): Promise<boolean> {
 
   let changed = false;
   for (const device of inSubnet) {
-    // A MAC already tracked in `leases` (whether issued by the real DHCP
-    // server above, a static reservation, or a previous ARP discovery) is
+    // A MAC already tracked in `leases` at all (whether issued by the real
+    // DHCP server, a static reservation, or a previous ARP discovery) is
     // authoritative — the real DHCP server's own record for a device is
-    // always more trustworthy than a possibly-stale ARP cache entry, so
-    // skip it entirely rather than overwriting its IP.
-    const existing = leases.find(l => normalizeMac(l.mac) === normalizeMac(device.mac) && l.status !== 'expired');
-    if (existing) continue;
+    // always more trustworthy than a possibly-stale ARP cache entry, so this
+    // never overwrites its IP.
+    //
+    // IMPORTANT (bug fixed, don't reintroduce): this used to also require
+    // `l.status !== 'expired'`. A device tracked only via ARP (no real DHCP
+    // client ever renews it) has no way to keep its pseudo-lease from
+    // expiring on schedule — expireLeases() marks it 'expired' the moment
+    // `expiresAt` passes regardless of whether the device is still online.
+    // With the old check, the very next ARP scan (every ~4s) no longer saw
+    // that MAC as "already tracked" and pushed a brand-new lease for it —
+    // repeating every ~leaseTime minutes forever, which is exactly why the
+    // same physical device could pile up many "Device-X" duplicate rows
+    // (all sharing one IP/MAC) over time. Now an expired-but-still-present
+    // device is revived in place instead of duplicated.
+    const existing = leases.find(l => normalizeMac(l.mac) === normalizeMac(device.mac));
+    if (existing) {
+      if (existing.status === 'expired') {
+        existing.status = 'active';
+        existing.leasedAt = new Date().toISOString();
+        existing.expiresAt = new Date(Date.now() + dhcpConfig.leaseTime * 60000).toISOString();
+        changed = true;
+      }
+      continue;
+    }
 
     const hostname = (await reverseDnsLookup(device.ip)) || `Device-${device.ip.split(".")[3]}`;
     leases.push({
@@ -3624,7 +3700,13 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
           stream.write("terminal length 0\n");
           setTimeout(() => stream.write("show cdp neighbors detail\n"), 500);
           setTimeout(() => stream.write("show lldp neighbors detail\n"), 2500);
-          setTimeout(() => finish({ success: true, output }), 5000);
+          // Extreme Networks (EXOS) switches don't recognize the "detail"
+          // keyword on this command — their plain "show lldp neighbors"
+          // (no "detail") is what actually returns neighbor info there.
+          // Harmless no-op/error echo on Cisco-style gear, same as the two
+          // commands above are on devices that don't support them.
+          setTimeout(() => stream.write("show lldp neighbors\n"), 4500);
+          setTimeout(() => finish({ success: true, output }), 7000);
         });
       });
 
@@ -3702,6 +3784,13 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
       socket.write("show cdp neighbors detail\n");
       await delay(2000);
       socket.write("show lldp neighbors detail\n");
+      await delay(2000);
+      // Extreme Networks (EXOS) switches don't recognize the "detail"
+      // keyword on this command — their plain "show lldp neighbors" (no
+      // "detail") is what actually returns neighbor info there. Harmless
+      // no-op/error echo on Cisco-style gear, same as the two commands
+      // above are on devices that don't support them.
+      socket.write("show lldp neighbors\n");
       await delay(2500);
     } catch (err: any) {
       try { connection.end(); } catch { /* already closed */ }
@@ -3715,10 +3804,13 @@ function queryNeighborInfo(host: TerminalHost): Promise<{ success: boolean; outp
 
 // CDP/LLDP neighbor lookup: SSH/Telnet into the device with a fresh,
 // temporary connection (never touches an existing liveSessions entry) and
-// return the raw "show cdp/lldp neighbors detail" output. Non-network
-// devices (plain PCs/servers) will typically just echo back "command not
-// found"-style output for these commands, which is expected and not treated
-// as a request failure.
+// return the raw output of "show cdp neighbors detail", "show lldp
+// neighbors detail", and "show lldp neighbors" (the last one specifically
+// for Extreme Networks/EXOS gear, which doesn't accept "detail" on that
+// command). Non-network devices (plain PCs/servers) and switches that don't
+// support a given command will typically just echo back "command not
+// found"-style output for it, which is expected and not treated as a
+// request failure.
 //
 // Accepts either a registered TerminalHost (via `hostId`) or an ad-hoc,
 // one-off set of connection details (`ip`/`port`/`protocol`/`username`/

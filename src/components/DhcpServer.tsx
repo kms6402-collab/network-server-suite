@@ -3,7 +3,7 @@ import {
   Server, Network, Plus, Trash2, ShieldAlert,
   HelpCircle, RefreshCw, Layers, Check, Database,
   Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
-  Radar, X, AlertCircle, Download, ArrowUp, ArrowDown, ArrowUpDown, Upload, Pencil
+  Radar, X, AlertCircle, Download, ArrowUp, ArrowDown, ArrowUpDown, Upload, Pencil, Pin
 } from 'lucide-react';
 import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
 
@@ -595,6 +595,16 @@ export default function DhcpServer({
     }
   };
 
+  // Turns an already-assigned dynamic lease into a permanent reservation
+  // with a single click, reusing the lease's current mac/ip/hostname as-is —
+  // no need to retype them into the reservation form below. onAddReservation
+  // already upgrades the matching lease to 'reserved' in place (see
+  // upsertReservation on the backend), so this row's status badge updates
+  // immediately without any extra confirmation step.
+  const handlePinLeaseAsReservation = (lease: DhcpLease) => {
+    onAddReservation(lease.mac, lease.ip, lease.hostname);
+  };
+
   const handleSubmitAdhocNeighborQuery = (e: React.FormEvent) => {
     e.preventDefault();
     if (!neighborModal || !credUsername) return;
@@ -1126,6 +1136,16 @@ export default function DhcpServer({
                         }`}>
                           {lease.status === 'reserved' ? 'STATIC' : 'DYNAMIC'}
                         </span>
+                        {lease.id !== 'host-pc-self' && lease.status !== 'reserved' && (
+                          <button
+                            id={`pin-lease-${lease.id}`}
+                            onClick={() => handlePinLeaseAsReservation(lease)}
+                            className="text-slate-400 hover:text-blue-400 p-0.5 rounded transition cursor-pointer"
+                            title="이 IP로 고정 예약 등록"
+                          >
+                            <Pin className="w-3 h-3" />
+                          </button>
+                        )}
                         {lease.id !== 'host-pc-self' && (
                           <button
                             id={`neighbors-lease-${lease.id}`}
@@ -1241,6 +1261,16 @@ export default function DhcpServer({
                           </span>
                         </td>
                         <td className="p-2 text-right pr-3">
+                          {lease.id !== 'host-pc-self' && lease.status !== 'reserved' && (
+                            <button
+                              id={`pin-lease-table-${lease.id}`}
+                              onClick={() => handlePinLeaseAsReservation(lease)}
+                              className="text-slate-400 hover:text-blue-400 p-1 rounded transition cursor-pointer"
+                              title="이 IP로 고정 예약 등록"
+                            >
+                              <Pin className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                           {lease.id !== 'host-pc-self' && (
                             <button
                               id={`neighbors-lease-table-${lease.id}`}
