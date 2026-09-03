@@ -3896,9 +3896,17 @@ app.post("/api/system/config", (req, res) => {
 });
 
 app.post("/api/system/reset", async (req, res) => {
-  // Clear persistent file state
+  // Clear persistent file state. Both files are deleted outright (not just
+  // overwritten via the saveState() call below) so a factory reset leaves no
+  // on-disk trace of the wiped account even if the ini rewrite step were to
+  // fail — setting.ini is a full independent copy of webAuth (password hash
+  // + salt included), so leaving a stale copy behind after "resetting" would
+  // defeat the point of the reset.
   if (fs.existsSync(STATE_FILE)) {
     fs.unlinkSync(STATE_FILE);
+  }
+  if (fs.existsSync(SETTINGS_FILE)) {
+    fs.unlinkSync(SETTINGS_FILE);
   }
 
   // Actually stop any real running engines — otherwise the status flags below
