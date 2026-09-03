@@ -3091,6 +3091,11 @@ interface LiveSession {
 }
 const liveSessions = new Map<string, LiveSession>();
 
+// execIds whose last `logs` entry is an unterminated raw-stream line that the
+// next stream chunk should keep extending, rather than starting a fresh
+// entry — see appendStreamChunk() below.
+const openStreamLineExecIds = new Set<string>();
+
 // Tear down a live session (if any) and mark the corresponding execution as
 // no longer having an open connection. Safe to call even if the session was
 // already removed (e.g. the underlying socket closed on its own right after
@@ -3102,6 +3107,7 @@ function closeLiveSession(execId: string, logMessage?: string) {
     try { session.close(); } catch { /* already closed */ }
     liveSessions.delete(execId);
   }
+  openStreamLineExecIds.delete(execId);
   const currentExec = scriptExecutions.find(e => e.id === execId);
   if (currentExec) {
     currentExec.sessionOpen = false;
@@ -3147,6 +3153,35 @@ function sanitizeTerminalOutput(raw: string): string {
   text = text.replace(/[\x00-\x08\x0b-\x1f]/g, "");
 
   return text;
+}
+
+// Feed a raw stream chunk into an execution's logs, buffered by real newline
+// boundaries instead of pushing one `logs` entry per raw TCP read. Some
+// devices (character-at-a-time keystroke echo, chunked "--More--" paging,
+// etc.) write output in small fragments that don't land on line breaks at
+// all — pushing each fragment as its own `logs` entry rendered every
+// fragment as a separate on-screen line (each entry is one block-level div
+// in the UI), so a single logical line came out visually shredded across
+// many rows. Instead, an in-progress line keeps growing in place until a
+// real '\n' arrives to close it off; only then does further data start a
+// new entry. Any *other* kind of log write (status messages, command
+// echoes) always starts its own fresh entry and clears this buffering state
+// first, so it never gets glued onto a dangling raw fragment.
+function appendStreamChunk(execId: string, chunk: string) {
+  if (!chunk) return;
+  const currentExec = scriptExecutions.find(e => e.id === execId);
+  if (!currentExec) return;
+
+  const segments = chunk.split("\n");
+  if (openStreamLineExecIds.has(execId) && currentExec.logs.length > 0) {
+    currentExec.logs[currentExec.logs.length - 1] += segments[0];
+  } else {
+    currentExec.logs.push(segments[0]);
+  }
+  for (let i = 1; i < segments.length; i++) {
+    currentExec.logs.push(segments[i]);
+  }
+  openStreamLineExecIds.add(execId);
 }
 
 // Run an interactive SSH shell session: connect, push each command in order
@@ -3197,8 +3232,8 @@ function runSshExecution(
       conn.shell((err, stream) => {
         if (err) return settleOnce(err);
 
-        stream.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
-        stream.stderr?.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
+        stream.on("data", (data: Buffer) => appendStreamChunk(execId, sanitizeTerminalOutput(data.toString())));
+        stream.stderr?.on("data", (data: Buffer) => appendStreamChunk(execId, sanitizeTerminalOutput(data.toString())));
         stream.on("error", (streamErr: any) => handleSessionEnd(streamErr));
         stream.on("close", () => handleSessionEnd());
 
@@ -3314,7 +3349,7 @@ function runTelnetExecution(
       saveState();
     };
 
-    connection.on("data", (data: Buffer) => appendLog(sanitizeTerminalOutput(data.toString())));
+    connection.on("data", (data: Buffer) => appendStreamChunk(execId, sanitizeTerminalOutput(data.toString())));
     // Registering these before connect() also prevents Node from throwing on
     // an unhandled 'error' event once the connection is kept open past the
     // initial connect() call.
@@ -3436,6 +3471,7 @@ async function runScriptExecution(execId: string, host: TerminalHost, script: Co
   const appendLog = (text: string) => {
     const currentExec = scriptExecutions.find(e => e.id === execId);
     if (currentExec) currentExec.logs.push(text);
+    openStreamLineExecIds.delete(execId);
   };
 
   // SSH authenticates as part of the protocol handshake itself, so there's no
@@ -3633,6 +3669,7 @@ app.post("/api/terminal/send", (req, res) => {
     }
     try {
       currentExec.logs.push(`\nManual_CLI# ${command}`);
+      openStreamLineExecIds.delete(execId);
       session.write(command + "\n");
       sentCount++;
     } catch (err: any) {

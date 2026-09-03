@@ -148,6 +148,16 @@ export default function TerminalAutomation({
   // on pre-update scroll position rather than the already-grown scrollHeight
   // (see handleLogScroll for how this gets kept up to date).
   const isNearBottomRef = useRef(true);
+  // Once the user manually clicks a session tab, the auto-follow effect below
+  // stops forcing the view back to whichever session happens to be running —
+  // without this, every ~1.5s poll tick (or every new host starting during a
+  // sequential batch run) snapped the view back to the running session even
+  // while the user was actively reading a *different*, already-finished tab,
+  // which looked like the mouse/screen randomly resetting itself. Explicitly
+  // starting a new run/manual-connect re-enables following (see
+  // handleRunScript/runBatchSequential/onManualConnect's onClick below),
+  // since that's a deliberate signal the user wants to watch it.
+  const userPinnedTabRef = useRef(false);
 
   const activeExec = executions.find(e => e.id === activeTabId);
   const openSessionCount = executions.filter(e => e.sessionOpen).length;
@@ -216,19 +226,31 @@ export default function TerminalAutomation({
   // active tab disappears from the list (e.g. the user closed it via
   // onCloseSession) — falls back to another open tab, or to null if none
   // remain, so a removed session's id never lingers as the "active" one.
+  //
+  // Does NOT auto-follow a running session once the user has manually picked
+  // a tab (userPinnedTabRef) — only the "tab disappeared" recovery path
+  // below overrides a pinned choice, since there's nothing left to respect
+  // at that point.
   useEffect(() => {
     if (executions.length === 0) {
       if (activeTabId !== null) setActiveTabId(null);
+      userPinnedTabRef.current = false;
       return;
     }
 
     const running = executions.find(e => e.status === 'running');
     const activeStillExists = activeTabId !== null && executions.some(e => e.id === activeTabId);
 
+    if (!activeStillExists) {
+      userPinnedTabRef.current = false;
+      setActiveTabId(running ? running.id : executions[executions.length - 1].id);
+      return;
+    }
+
+    if (userPinnedTabRef.current) return;
+
     if (running) {
       setActiveTabId(running.id);
-    } else if (!activeStillExists) {
-      setActiveTabId(executions[executions.length - 1].id);
     }
   }, [executions]);
 
@@ -501,8 +523,18 @@ export default function TerminalAutomation({
   };
   const sortedHosts = [...hosts].sort(compareHostsByIp);
 
+  // The only way activeTabId changes as a direct result of the user clicking
+  // a tab — see the auto-follow effect above for why this matters.
+  const handleSelectTab = (id: string) => {
+    userPinnedTabRef.current = true;
+    setActiveTabId(id);
+  };
+
   const handleRunScript = () => {
     if (!selectedScriptId) return;
+    // A deliberate "run" click is a clear signal to watch what it starts,
+    // so let the auto-follow effect resume steering the view.
+    userPinnedTabRef.current = false;
     if (batchModeActive) {
       const orderedIds = sortedHosts.filter(h => selectedHostIds.has(h.id)).map(h => h.id);
       runBatchSequential(orderedIds, selectedScriptId);
@@ -544,6 +576,7 @@ export default function TerminalAutomation({
       return;
     }
     setBatchJobError(null);
+    userPinnedTabRef.current = false;
     runBatchSequential(targetHostIds, job.scriptId);
   };
 
@@ -1058,7 +1091,7 @@ export default function TerminalAutomation({
                   <div className="flex items-center gap-0.5 shrink-0">
                     <button
                       id={`manual-connect-${host.id}`}
-                      onClick={() => onManualConnect(host.id)}
+                      onClick={() => { userPinnedTabRef.current = false; onManualConnect(host.id); }}
                       className="p-1.5 text-slate-400 hover:text-emerald-400 rounded-lg hover:bg-emerald-950/20 cursor-pointer transition"
                       title="수동 접속 (Manual Connect)"
                     >
@@ -1379,7 +1412,7 @@ export default function TerminalAutomation({
                 <button
                   id={`tab-${exec.id}`}
                   key={exec.id}
-                  onClick={() => setActiveTabId(exec.id)}
+                  onClick={() => handleSelectTab(exec.id)}
                   className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold shrink-0 flex items-center gap-1.5 border cursor-pointer transition ${
                     activeTabId === exec.id
                       ? 'bg-slate-950 text-emerald-400 border-slate-700/80'
