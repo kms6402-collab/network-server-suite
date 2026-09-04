@@ -22,7 +22,9 @@ import {
   CommandScript,
   ScriptExecution,
   SystemStatus,
-  BatchJob
+  BatchJob,
+  BatchRun,
+  BatchRunHostResult
 } from "./src/types.js";
 
 // esbuild bundles this file to CJS for pkg, where import.meta.url is empty
@@ -149,10 +151,17 @@ let terminalHosts: TerminalHost[] = [];
 let commandScripts: CommandScript[] = [];
 let scriptExecutions: ScriptExecution[] = [];
 // Saved "device list + script" combinations for one-click batch re-runs
-// (see POST /api/batch-jobs / DELETE /api/batch-jobs/:id below). Execution
-// itself has no backend representation — the frontend just replays the
-// existing per-host /api/scripts/execute fan-out.
+// (see POST /api/batch-jobs / DELETE /api/batch-jobs/:id below).
 let batchJobs: BatchJob[] = [];
+
+// The one currently-running (or just-finished) batch run — see
+// runBatchOrchestration below. Deliberately in-memory only (not part of
+// saveState()/loadState()): it's a live progress view over ScriptExecution
+// records that already persist on their own, and a server restart already
+// drops every live SSH/Telnet session anyway, so there's nothing meaningful
+// left to resume. Only one batch can run at a time, matching the frontend's
+// single progress bar.
+let activeBatchRun: BatchRun | null = null;
 
 // Clean standard boot log
 let dhcpConsoleLogs: { timestamp: string; level: 'INFO' | 'SUCCESS' | 'WARN'; message: string }[] = [
@@ -3060,9 +3069,8 @@ app.put("/api/scripts/:id", (req, res) => {
   res.json({ success: true, commandScripts });
 });
 
-// Saved Batch Jobs ("device list + script" combo, replayed with one click).
-// Purely CRUD here — execution stays a frontend fan-out over the existing
-// /api/scripts/execute endpoint (see TerminalAutomation.tsx).
+// Saved Batch Jobs ("device list + script" combo, replayed with one click
+// via POST /api/batch-runs/start below). Purely CRUD here.
 app.post("/api/batch-jobs", (req, res) => {
   const { name, hostIds, scriptId } = req.body;
   if (!name || !Array.isArray(hostIds) || hostIds.length === 0 || !scriptId) {
@@ -3080,6 +3088,127 @@ app.delete("/api/batch-jobs/:id", (req, res) => {
   batchJobs = batchJobs.filter(j => j.id !== id);
   saveState();
   res.json({ success: true, batchJobs });
+});
+
+// Runs `run` to completion: up to `run.concurrency` hosts connected at once,
+// each worker pulling the next un-started host off `run.hostIds` as soon as
+// its previous one settles. Lives entirely on the backend (reusing the same
+// runScriptExecution() used by the single-host /api/scripts/execute) so
+// progress keeps advancing whether or not any browser has the CLI 자동화
+// screen open — unlike the old frontend-only sequential loop this replaces,
+// which stalled once its component unmounted (see BatchRun in types.ts).
+async function runBatchOrchestration(run: BatchRun) {
+  let nextIndex = 0;
+  const claimNextHostId = (): string | null => {
+    if (run.status !== 'running' || nextIndex >= run.hostIds.length) return null;
+    return run.hostIds[nextIndex++];
+  };
+
+  const worker = async () => {
+    for (;;) {
+      const hostId = claimNextHostId();
+      if (!hostId) return;
+      const result = run.results.find(r => r.hostId === hostId);
+      if (!result) continue;
+
+      const host = terminalHosts.find(h => h.id === hostId);
+      const script = commandScripts.find(s => s.id === run.scriptId);
+      if (!host || !script) {
+        result.status = 'failed';
+        continue;
+      }
+
+      const execId = "exec-" + Date.now() + "-" + Math.random().toString(36).slice(2, 7);
+      result.execId = execId;
+      result.status = 'running';
+
+      const execution: ScriptExecution = {
+        id: execId,
+        hostId,
+        scriptId: run.scriptId,
+        status: 'running',
+        currentCommand: script.commands[0],
+        progress: 0,
+        logs: [`[${nowStr()}] [배치] ${host.protocol} 접속을 시도합니다: ${host.ip}:${host.port} (${host.username ? `사용자: ${host.username}` : "계정 정보 없음"})...`],
+        timestamp: new Date().toISOString(),
+        sessionOpen: false
+      };
+      scriptExecutions.push(execution);
+      saveState();
+
+      // Waits for this host's script to actually finish (or fail) before the
+      // worker moves on to its next claimed host — runScriptExecution only
+      // resolves once the commands have been sent and status is settled.
+      await runScriptExecution(execId, host, script).catch(err => {
+        console.error(`Batch execution ${execId} failed unexpectedly`, err);
+      });
+
+      const finished = scriptExecutions.find(e => e.id === execId);
+      result.status = finished?.status === 'failed' ? 'failed' : 'completed';
+      saveState();
+    }
+  };
+
+  const workerCount = Math.max(1, Math.min(run.concurrency, run.hostIds.length));
+  await Promise.all(Array.from({ length: workerCount }, worker));
+
+  if (run.status === 'running') run.status = 'completed';
+  run.finishedAt = new Date().toISOString();
+}
+
+app.post("/api/batch-runs/start", (req, res) => {
+  if (activeBatchRun && activeBatchRun.status === 'running') {
+    return res.status(409).json({ error: "이미 실행 중인 배치 작업이 있습니다. 먼저 취소하거나 완료를 기다리세요." });
+  }
+
+  const { hostIds, scriptId, concurrency } = req.body;
+  if (!Array.isArray(hostIds) || hostIds.length === 0 || !scriptId) {
+    return res.status(400).json({ error: "hostIds(1개 이상), scriptId가 필요합니다." });
+  }
+  if (!commandScripts.some(s => s.id === scriptId)) {
+    return res.status(404).json({ error: "스크립트를 찾을 수 없습니다." });
+  }
+  const validHostIds: string[] = hostIds.filter((id: string) => terminalHosts.some(h => h.id === id));
+  if (validHostIds.length === 0) {
+    return res.status(404).json({ error: "유효한 장비가 없습니다." });
+  }
+
+  const run: BatchRun = {
+    id: "batchrun-" + Date.now(),
+    scriptId,
+    hostIds: validHostIds,
+    // 1-20: below 1 would never dispatch anything, and an unbounded value
+    // risks opening dozens of simultaneous SSH/Telnet sessions to the LAN at
+    // once from a single click.
+    concurrency: Math.max(1, Math.min(Number(concurrency) || 5, 20)),
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    results: validHostIds.map((hostId: string): BatchRunHostResult => ({
+      hostId,
+      hostName: terminalHosts.find(h => h.id === hostId)?.name || hostId,
+      status: 'pending'
+    }))
+  };
+  activeBatchRun = run;
+
+  runBatchOrchestration(run).catch(err => {
+    console.error(`Batch run ${run.id} failed unexpectedly`, err);
+    run.status = 'cancelled';
+    run.finishedAt = new Date().toISOString();
+  });
+
+  res.json({ success: true, batchRun: run });
+});
+
+// Stops the batch from claiming any *new* hosts — workers currently mid-host
+// let that one host's script finish naturally (same semantics the old
+// frontend cancel button had) rather than yanking a live connection mid-run.
+app.post("/api/batch-runs/cancel", (req, res) => {
+  if (activeBatchRun && activeBatchRun.status === 'running') {
+    activeBatchRun.status = 'cancelled';
+    activeBatchRun.finishedAt = new Date().toISOString();
+  }
+  res.json({ success: true, batchRun: activeBatchRun });
 });
 
 // Automation Script Execution Engine
@@ -3622,7 +3751,7 @@ app.post("/api/scripts/execute", (req, res) => {
 });
 
 app.get("/api/scripts/executions", (req, res) => {
-  res.json({ scriptExecutions });
+  res.json({ scriptExecutions, activeBatchRun });
 });
 
 app.get("/api/scripts/executions/:id", (req, res) => {
@@ -3661,6 +3790,13 @@ app.post("/api/scripts/executions/close-all", (req, res) => {
   }
 
   scriptExecutions = [];
+  // Every ScriptExecution a running batch was tracking just disappeared —
+  // stop it from claiming further hosts rather than leaving its progress
+  // bar stuck referencing records that no longer exist.
+  if (activeBatchRun && activeBatchRun.status === 'running') {
+    activeBatchRun.status = 'cancelled';
+    activeBatchRun.finishedAt = new Date().toISOString();
+  }
   saveState();
   res.json({ success: true, scriptExecutions });
 });
@@ -4010,6 +4146,8 @@ app.post("/api/system/reset", async (req, res) => {
     closeLiveSession(execId);
   }
   scriptExecutions = [];
+  batchJobs = [];
+  activeBatchRun = null;
 
   saveState();
   res.json({ success: true, message: "System reset to factory defaults successfully." });

@@ -109,14 +109,38 @@ export interface CommandScript {
 }
 
 // A saved "device list + script" combination that can be re-run as a single
-// batch (see TerminalAutomation.tsx "저장된 배치 작업" panel). Purely a
-// frontend convenience over the existing per-host POST /api/scripts/execute
-// fan-out — no dedicated execution logic lives on the backend for this.
+// batch (see TerminalAutomation.tsx "저장된 배치 작업" panel) via
+// POST /api/batch-runs/start (see BatchRun below for the actual run).
 export interface BatchJob {
   id: string;
   name: string;
   hostIds: string[];
   scriptId: string;
+}
+
+// A single host's progress within a running BatchRun.
+export interface BatchRunHostResult {
+  hostId: string;
+  hostName: string;
+  execId?: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+}
+
+// Runs one script across many hosts with up to `concurrency` sessions active
+// at once — orchestrated entirely on the backend (see runBatchOrchestration
+// in server.ts) so it keeps making progress regardless of whether any
+// browser tab has the CLI 자동화 screen open. Not persisted across a server
+// restart (in-memory only): each host's own ScriptExecution record is what
+// actually survives, this is just the batch-level grouping/progress view.
+export interface BatchRun {
+  id: string;
+  scriptId: string;
+  hostIds: string[];
+  concurrency: number;
+  status: 'running' | 'completed' | 'cancelled';
+  startedAt: string;
+  finishedAt?: string;
+  results: BatchRunHostResult[];
 }
 
 export interface ScriptExecution {

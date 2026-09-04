@@ -4,7 +4,7 @@ import {
   Send, Server, AlertCircle, RefreshCw, Download, Plug, Unplug, Radio,
   Wifi, CheckSquare, Square, PencilLine, X, XCircle, Save, Bookmark, Search
 } from 'lucide-react';
-import { TerminalHost, CommandScript, ScriptExecution, DhcpLease, BatchJob } from '../types';
+import { TerminalHost, CommandScript, ScriptExecution, DhcpLease, BatchJob, BatchRun } from '../types';
 
 interface TerminalAutomationProps {
   hosts: TerminalHost[];
@@ -14,6 +14,9 @@ interface TerminalAutomationProps {
   batchJobs: BatchJob[];
   onSaveBatchJob: (name: string, hostIds: string[], scriptId: string) => void;
   onDeleteBatchJob: (id: string) => void;
+  activeBatchRun: BatchRun | null;
+  onStartBatchRun: (hostIds: string[], scriptId: string, concurrency: number) => Promise<{ success: boolean; error?: string }>;
+  onCancelBatchRun: () => void;
   onAddHost: (name: string, ip: string, port: number, protocol: 'SSH' | 'TELNET', username: string, password?: string) => void;
   onUpdateHost: (id: string, name: string, ip: string, port: number, protocol: 'SSH' | 'TELNET', username: string, password?: string) => void;
   onRemoveHost: (id: string) => void;
@@ -40,6 +43,9 @@ export default function TerminalAutomation({
   batchJobs,
   onSaveBatchJob,
   onDeleteBatchJob,
+  activeBatchRun,
+  onStartBatchRun,
+  onCancelBatchRun,
   onAddHost,
   onUpdateHost,
   onRemoveHost,
@@ -151,70 +157,35 @@ export default function TerminalAutomation({
   // Once the user manually clicks a session tab, the auto-follow effect below
   // stops forcing the view back to whichever session happens to be running —
   // without this, every ~1.5s poll tick (or every new host starting during a
-  // sequential batch run) snapped the view back to the running session even
-  // while the user was actively reading a *different*, already-finished tab,
-  // which looked like the mouse/screen randomly resetting itself. Explicitly
+  // batch run) snapped the view back to the running session even while the
+  // user was actively reading a *different*, already-finished tab, which
+  // looked like the mouse/screen randomly resetting itself. Explicitly
   // starting a new run/manual-connect re-enables following (see
-  // handleRunScript/runBatchSequential/onManualConnect's onClick below),
-  // since that's a deliberate signal the user wants to watch it.
+  // handleRunScript/onManualConnect's onClick below), since that's a
+  // deliberate signal the user wants to watch it.
   const userPinnedTabRef = useRef(false);
 
   const activeExec = executions.find(e => e.id === activeTabId);
   const openSessionCount = executions.filter(e => e.sessionOpen).length;
 
-  // Sequential batch runner state: unlike the old staggered fan-out (all
-  // hosts fired ~200ms apart, running concurrently), this queues one host at
-  // a time and waits for its execution to reach a terminal status before
-  // starting the next, so many devices no longer open dozens of simultaneous
-  // sessions at once (see the session-tab layout report this replaced).
-  const [batchRunning, setBatchRunning] = useState(false);
-  const [batchProgress, setBatchProgress] = useState<{ current: number; total: number; hostName: string } | null>(null);
-  const batchCancelRef = useRef(false);
-  // Kept in sync with the `executions` prop so the polling-based wait loop
-  // below always reads the latest snapshot without re-subscribing per tick.
-  const executionsRef = useRef(executions);
-  useEffect(() => { executionsRef.current = executions; }, [executions]);
-
-  // Polls until the execution reaches a terminal status. `seen` guards
-  // against the race right after dispatch, where the parent's `executions`
-  // state hasn't picked up the brand-new record yet — without it, "not found"
-  // on the very first tick would be misread as "already finished" and the
-  // whole queue would fire almost simultaneously instead of one at a time.
-  const waitForExecutionSettled = (execId: string, timeoutMs = 5 * 60 * 1000) => {
-    return new Promise<void>((resolve) => {
-      const start = Date.now();
-      let seen = false;
-      const tick = () => {
-        if (batchCancelRef.current) { resolve(); return; }
-        const exec = executionsRef.current.find(e => e.id === execId);
-        if (exec) seen = true;
-        const settled = (seen && !exec) || (!!exec && (exec.status === 'completed' || exec.status === 'failed'));
-        if (settled || Date.now() - start > timeoutMs) { resolve(); return; }
-        setTimeout(tick, 400);
-      };
-      tick();
-    });
-  };
-
-  // Runs a script across many hosts one at a time: start host N, wait for its
-  // execution to finish (completed/failed), then move on to host N+1.
-  const runBatchSequential = async (hostIds: string[], scriptId: string) => {
-    if (batchRunning || hostIds.length === 0) return;
-    setBatchRunning(true);
-    batchCancelRef.current = false;
-    setBatchJobError(null);
-    for (let i = 0; i < hostIds.length; i++) {
-      if (batchCancelRef.current) break;
-      const hostId = hostIds[i];
-      setBatchProgress({ current: i + 1, total: hostIds.length, hostName: getHostNameFromId(hostId) });
-      const execId = await onExecuteScript(hostId, scriptId);
-      if (execId) {
-        await waitForExecutionSettled(execId);
-      }
-    }
-    setBatchRunning(false);
-    setBatchProgress(null);
-  };
+  // Batch execution itself is now orchestrated entirely on the backend (see
+  // runBatchOrchestration in server.ts) — this component just starts/cancels
+  // it and renders whatever activeBatchRun reports on the next 1.5s poll.
+  // That's what keeps it progressing across tab switches: unlike the old
+  // client-side sequential loop this replaced (a `for` await-loop living in
+  // this component's own closure), there's no in-progress state here that a
+  // remount could ever lose.
+  const batchRunning = activeBatchRun?.status === 'running';
+  const batchCompletedCount = activeBatchRun
+    ? activeBatchRun.results.filter(r => r.status === 'completed' || r.status === 'failed').length
+    : 0;
+  const batchTotalCount = activeBatchRun?.results.length ?? 0;
+  const batchRunningHostNames = activeBatchRun
+    ? activeBatchRun.results.filter(r => r.status === 'running').map(r => r.hostName)
+    : [];
+  // How many sessions run at once — the actual concurrency cap is clamped
+  // server-side too (1-20), this is just the input's own sane range.
+  const [batchConcurrency, setBatchConcurrency] = useState(5);
 
   // Update defaults when hosts/scripts load
   useEffect(() => {
@@ -530,14 +501,17 @@ export default function TerminalAutomation({
     setActiveTabId(id);
   };
 
-  const handleRunScript = () => {
+  const handleRunScript = async () => {
     if (!selectedScriptId) return;
     // A deliberate "run" click is a clear signal to watch what it starts,
     // so let the auto-follow effect resume steering the view.
     userPinnedTabRef.current = false;
     if (batchModeActive) {
+      if (batchRunning) return;
       const orderedIds = sortedHosts.filter(h => selectedHostIds.has(h.id)).map(h => h.id);
-      runBatchSequential(orderedIds, selectedScriptId);
+      setBatchJobError(null);
+      const result = await onStartBatchRun(orderedIds, selectedScriptId, batchConcurrency);
+      if (!result.success) setBatchJobError(result.error || '배치 작업을 시작하지 못했습니다.');
       return;
     }
     if (!selectedHostId) return;
@@ -563,9 +537,10 @@ export default function TerminalAutomation({
   };
 
   // Re-run a saved batch job: filter out hosts/scripts that may have been
-  // removed since the job was saved, then run them sequentially the same way
+  // removed since the job was saved, then run them the same way
   // handleRunScript does for the live multi-select.
-  const handleRunSavedBatchJob = (job: BatchJob) => {
+  const handleRunSavedBatchJob = async (job: BatchJob) => {
+    if (batchRunning) return;
     if (!scripts.some(s => s.id === job.scriptId)) {
       setBatchJobError(`"${job.name}" 스크립트가 삭제되었습니다.`);
       return;
@@ -577,7 +552,8 @@ export default function TerminalAutomation({
     }
     setBatchJobError(null);
     userPinnedTabRef.current = false;
-    runBatchSequential(targetHostIds, job.scriptId);
+    const result = await onStartBatchRun(targetHostIds, job.scriptId, batchConcurrency);
+    if (!result.success) setBatchJobError(result.error || '배치 작업을 시작하지 못했습니다.');
   };
 
   const handleSendManualCommand = (e: React.FormEvent) => {
@@ -1022,7 +998,7 @@ export default function TerminalAutomation({
             <div className="flex-1 flex flex-col min-h-0 space-y-2">
               {hosts.length > 0 && (
                 <p className="text-[10px] text-slate-500 shrink-0">
-                  장비를 체크하면 오른쪽 배치 실행기에서 여러 대에 스크립트를 순차 실행할 수 있습니다.
+                  장비를 체크하면 오른쪽 배치 실행기에서 여러 대에 스크립트를 동시에 실행할 수 있습니다.
                 </p>
               )}
               {hosts.length > 0 && (
@@ -1245,7 +1221,7 @@ export default function TerminalAutomation({
               배치 실행기
             </h3>
             <p className="text-xs text-slate-400 leading-relaxed">
-              장비와 스크립트를 선택 후 실행하세요. 여러 대 선택 시 한 대씩 순차 실행됩니다.
+              장비와 스크립트를 선택 후 실행하세요. 여러 대 선택 시 지정한 동시 실행 수만큼 병렬로 실행됩니다.
             </p>
 
             <div className="space-y-2.5 pt-2">
@@ -1259,7 +1235,7 @@ export default function TerminalAutomation({
                     className="accent-indigo-500 cursor-pointer"
                   />
                   <CheckSquare className="w-3 h-3" />
-                  선택 {selectedHostIds.size}개 장비 순차 실행
+                  선택 {selectedHostIds.size}개 장비 동시 실행
                 </label>
               )}
 
@@ -1295,21 +1271,41 @@ export default function TerminalAutomation({
           </div>
 
           <div className="space-y-2">
-            {batchRunning && batchProgress && (
+            {batchModeActive && !batchRunning && (
+              <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                <label htmlFor="batch-concurrency-input" title="한 번에 동시 접속할 세션 수입니다. 장비/네트워크 부하를 고려해 조절하세요.">
+                  동시 실행 세션 수
+                </label>
+                <input
+                  id="batch-concurrency-input"
+                  type="number"
+                  min={1}
+                  max={20}
+                  value={batchConcurrency}
+                  onChange={(e) => setBatchConcurrency(Math.max(1, Math.min(Number(e.target.value) || 1, 20)))}
+                  className="w-16 bg-slate-950 border border-slate-800 rounded-lg p-1.5 text-white text-xs text-center focus:outline-none focus:border-indigo-500 transition"
+                />
+              </div>
+            )}
+
+            {batchRunning && (
               <div className="space-y-1.5">
                 <div className="flex items-center justify-between text-[11px] text-slate-400">
-                  <span className="truncate">{batchProgress.current}/{batchProgress.total} · {batchProgress.hostName}</span>
+                  <span className="truncate">
+                    완료 {batchCompletedCount}/{batchTotalCount}
+                    {batchRunningHostNames.length > 0 && ` · 실행 중: ${batchRunningHostNames.join(', ')}`}
+                  </span>
                   <button
                     type="button"
                     id="cancel-batch-run-btn"
-                    onClick={() => { batchCancelRef.current = true; }}
+                    onClick={onCancelBatchRun}
                     className="text-rose-400 hover:text-rose-300 cursor-pointer font-bold shrink-0"
                   >
                     중지
                   </button>
                 </div>
                 <div className="w-full bg-slate-800 h-1.5 rounded-full overflow-hidden">
-                  <div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${(batchProgress.current / batchProgress.total) * 100}%` }}></div>
+                  <div className="h-full bg-indigo-500 transition-all duration-300" style={{ width: `${batchTotalCount > 0 ? (batchCompletedCount / batchTotalCount) * 100 : 0}%` }}></div>
                 </div>
               </div>
             )}
@@ -1322,9 +1318,9 @@ export default function TerminalAutomation({
             >
               <Play className="w-4 h-4 text-emerald-100" />
               {batchRunning
-                ? `실행 중 (${batchProgress?.current ?? 0}/${batchProgress?.total ?? 0})`
+                ? `실행 중 (${batchCompletedCount}/${batchTotalCount})`
                 : batchModeActive
-                  ? `선택 ${selectedHostIds.size}개 순차 실행`
+                  ? `선택 ${selectedHostIds.size}개 동시 ${batchConcurrency}대씩 실행`
                   : '배치 실행'}
             </button>
 

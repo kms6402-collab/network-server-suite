@@ -4,7 +4,7 @@ import {
 } from 'lucide-react';
 import {
   SystemStatus, DhcpConfig, DhcpLease, DhcpReservation,
-  TftpFtpConfig, FtpCredential, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution, BatchJob
+  TftpFtpConfig, FtpCredential, FileRecord, TransferLog, TerminalHost, CommandScript, ScriptExecution, BatchJob, BatchRun
 } from './types';
 
 // Import sub-components
@@ -161,6 +161,9 @@ export default function App() {
   const [dhcpConsoleLogs, setDhcpConsoleLogs] = useState<{ timestamp: string; level: 'INFO' | 'SUCCESS' | 'WARN'; message: string }[]>([]);
   const [scriptExecutions, setScriptExecutions] = useState<ScriptExecution[]>([]);
   const [batchJobs, setBatchJobs] = useState<BatchJob[]>([]);
+  // The currently running (or just-finished) batch run, driven entirely by
+  // the backend's runBatchOrchestration — see handleStartBatchRun below.
+  const [activeBatchRun, setActiveBatchRun] = useState<BatchRun | null>(null);
 
   // Function to load all backend state together
   const fetchAllState = async () => {
@@ -195,6 +198,7 @@ export default function App() {
       if (execResponse.ok) {
         const execData = await execResponse.json();
         setScriptExecutions(execData.scriptExecutions);
+        setActiveBatchRun(execData.activeBatchRun || null);
       }
 
       // Also list served files
@@ -827,6 +831,38 @@ export default function App() {
     } catch (e) { console.error(e); }
   };
 
+  // Starts a batch run entirely on the backend (see runBatchOrchestration in
+  // server.ts) — up to `concurrency` hosts run at once, and progress keeps
+  // advancing via the normal 1.5s poll regardless of which tab is open.
+  const handleStartBatchRun = async (hostIds: string[], scriptId: string, concurrency: number): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/batch-runs/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ hostIds, scriptId, concurrency })
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success !== false) {
+        setActiveBatchRun(data.batchRun);
+        return { success: true };
+      }
+      return { success: false, error: data.error || '배치 작업을 시작하지 못했습니다.' };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '네트워크 오류로 배치 작업을 시작하지 못했습니다.' };
+    }
+  };
+
+  const handleCancelBatchRun = async () => {
+    try {
+      const res = await fetch('/api/batch-runs/cancel', { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        setActiveBatchRun(data.batchRun);
+      }
+    } catch (e) { console.error(e); }
+  };
+
   // Settings & Recovery
   const handleToggleAutoStart = async (enabled: boolean) => {
     try {
@@ -899,7 +935,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.12.0 Enterprise
+                v2.13.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -1042,6 +1078,9 @@ export default function App() {
                 batchJobs={batchJobs}
                 onSaveBatchJob={handleSaveBatchJob}
                 onDeleteBatchJob={handleDeleteBatchJob}
+                activeBatchRun={activeBatchRun}
+                onStartBatchRun={handleStartBatchRun}
+                onCancelBatchRun={handleCancelBatchRun}
                 onAddHost={handleAddHost}
                 onUpdateHost={handleUpdateHost}
                 onRemoveHost={handleRemoveHost}
