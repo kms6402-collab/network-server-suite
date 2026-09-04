@@ -14,9 +14,10 @@ export interface DhcpConfig {
   serverIp?: string;
   // Additional address ranges within the same adapter/subnet, on top of
   // rangeStart-rangeEnd above — e.g. a /23 or /22 pool split into separate
-  // chunks (so a block in the middle can be excluded from leasing). All
-  // ranges share the same interfaceName/subnetMask/gateway/dns/serverIp/
-  // leaseTime; only the address boundaries differ per entry.
+  // chunks (so a block in the middle can be excluded from leasing). Every
+  // range always shares this DhcpConfig's interfaceName/subnetMask/serverIp
+  // (there's only one bound adapter and one server identity), but each range
+  // can override gateway/dns/leaseTime for clients landing in it.
   extraRanges?: DhcpRange[];
 }
 
@@ -24,6 +25,11 @@ export interface DhcpRange {
   id: string;
   start: string;
   end: string;
+  // Per-range overrides — omitted (or a value predating this field) falls
+  // back to the top-level DhcpConfig field of the same name.
+  gateway?: string;
+  dns?: string;
+  leaseTime?: number;
 }
 
 export interface DhcpLease {

@@ -637,46 +637,40 @@ function buildDhcpReply(opts: {
   return buf.subarray(0, offset);
 }
 
-function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: string) {
-  if (!dhcpSocket) return;
-  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
-  if (!hostInfo) return;
-
-  const buf = buildDhcpReply({
-    messageType,
-    xid: pkt.xid,
-    flags: pkt.flags,
-    yiaddr: offeredIp,
-    chaddr: pkt.chaddr,
-    serverIp: hostInfo.ip,
-    subnetMask: dhcpConfig.subnetMask,
-    router: dhcpConfig.gateway,
-    dns: dhcpConfig.dns,
-    leaseSeconds: dhcpConfig.leaseTime * 60
-  });
-
-  // See the isolation note above: always the *subnet-directed* broadcast of
-  // the selected adapter's own subnet, never the global 255.255.255.255, so
-  // the OS can only route this out through dhcpConfig.interfaceName.
-  const broadcastAddr = computeBroadcastAddress(hostInfo.ip, dhcpConfig.subnetMask);
-  dhcpSocket.send(buf, 0, buf.length, 68, broadcastAddr, (err) => {
-    if (err) logDhcp('WARN', `DHCP 응답 패킷 전송 실패: ${err.message}`);
-  });
-}
-
-// All configured address ranges as (start,end) int pairs — the primary
-// rangeStart/rangeEnd plus any extraRanges (additional pool chunks, e.g. a
-// /23 or /22 split into separate address blocks on the same subnet).
+// All configured address ranges — the primary rangeStart/rangeEnd plus any
+// extraRanges (additional pool chunks, e.g. a /23 or /22 split into separate
+// address blocks on the same adapter/subnet). Every range resolves to the
+// same subnetMask/interfaceName/serverIp (there is only one bound adapter
+// and one server identity), but gateway/dns/leaseTime fall back to the
+// top-level DhcpConfig value only when the range doesn't override them —
+// e.g. a shorter-lease guest pool alongside a longer-lease device pool.
 // Invalid entries (bad format, or start > end) are silently skipped rather
 // than rejecting the whole pool.
-function getAllDhcpRanges(): { start: number; end: number }[] {
-  const raw = [{ start: dhcpConfig.rangeStart, end: dhcpConfig.rangeEnd }, ...(dhcpConfig.extraRanges || [])];
-  const ranges: { start: number; end: number }[] = [];
+interface ResolvedDhcpRange {
+  start: number;
+  end: number;
+  gateway: string;
+  dns: string;
+  leaseTime: number;
+}
+
+function getAllDhcpRanges(): ResolvedDhcpRange[] {
+  const raw = [
+    { start: dhcpConfig.rangeStart, end: dhcpConfig.rangeEnd, gateway: dhcpConfig.gateway, dns: dhcpConfig.dns, leaseTime: dhcpConfig.leaseTime },
+    ...(dhcpConfig.extraRanges || []).map(r => ({
+      start: r.start,
+      end: r.end,
+      gateway: r.gateway || dhcpConfig.gateway,
+      dns: r.dns || dhcpConfig.dns,
+      leaseTime: r.leaseTime || dhcpConfig.leaseTime
+    }))
+  ];
+  const ranges: ResolvedDhcpRange[] = [];
   for (const r of raw) {
     const start = ipToInt(r.start);
     const end = ipToInt(r.end);
     if (!isValidIPv4(r.start) || !isValidIPv4(r.end) || start > end) continue;
-    ranges.push({ start, end });
+    ranges.push({ start, end, gateway: r.gateway, dns: r.dns, leaseTime: r.leaseTime });
   }
   return ranges;
 }
@@ -684,6 +678,18 @@ function getAllDhcpRanges(): { start: number; end: number }[] {
 function isIpInAnyDhcpRange(ip: string): boolean {
   const n = ipToInt(ip);
   return getAllDhcpRanges().some(r => n >= r.start && n <= r.end);
+}
+
+// The gateway/dns/leaseTime that should actually apply to a given IP — the
+// range it falls in if one matches (first match wins), otherwise the
+// top-level DhcpConfig defaults (e.g. for a static reservation sitting
+// outside every configured range).
+function getDhcpOptionsForIp(ip: string): { gateway: string; dns: string; leaseTime: number } {
+  const n = ipToInt(ip);
+  const match = getAllDhcpRanges().find(r => n >= r.start && n <= r.end);
+  return match
+    ? { gateway: match.gateway, dns: match.dns, leaseTime: match.leaseTime }
+    : { gateway: dhcpConfig.gateway, dns: dhcpConfig.dns, leaseTime: dhcpConfig.leaseTime };
 }
 
 function findAvailableIp(): string | null {
@@ -698,11 +704,39 @@ function findAvailableIp(): string | null {
   return null;
 }
 
+function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: string) {
+  if (!dhcpSocket) return;
+  const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName, dhcpConfig.serverIp);
+  if (!hostInfo) return;
+
+  const opts = getDhcpOptionsForIp(offeredIp);
+  const buf = buildDhcpReply({
+    messageType,
+    xid: pkt.xid,
+    flags: pkt.flags,
+    yiaddr: offeredIp,
+    chaddr: pkt.chaddr,
+    serverIp: hostInfo.ip,
+    subnetMask: dhcpConfig.subnetMask,
+    router: opts.gateway,
+    dns: opts.dns,
+    leaseSeconds: opts.leaseTime * 60
+  });
+
+  // See the isolation note above: always the *subnet-directed* broadcast of
+  // the selected adapter's own subnet, never the global 255.255.255.255, so
+  // the OS can only route this out through dhcpConfig.interfaceName.
+  const broadcastAddr = computeBroadcastAddress(hostInfo.ip, dhcpConfig.subnetMask);
+  dhcpSocket.send(buf, 0, buf.length, 68, broadcastAddr, (err) => {
+    if (err) logDhcp('WARN', `DHCP 응답 패킷 전송 실패: ${err.message}`);
+  });
+}
+
 // Add/update the single lease record for a MAC. This *is* the server's
 // internal lease-tracking structure — there is no separate table — so
 // deleting an entry from `leases` (e.g. via DELETE /api/dhcp/leases/:id)
 // immediately makes that IP available again through findAvailableIp().
-function upsertLease(mac: string, ip: string, hostname: string, status: 'active' | 'reserved'): DhcpLease {
+function upsertLease(mac: string, ip: string, hostname: string, status: 'active' | 'reserved', leaseTimeMinutes: number = dhcpConfig.leaseTime): DhcpLease {
   const now = Date.now();
   const idx = leases.findIndex(l => normalizeMac(l.mac) === mac && l.id !== 'host-pc-self');
   const record: DhcpLease = {
@@ -712,7 +746,7 @@ function upsertLease(mac: string, ip: string, hostname: string, status: 'active'
     hostname,
     interfaceName: dhcpConfig.interfaceName,
     leasedAt: new Date(now).toISOString(),
-    expiresAt: new Date(now + dhcpConfig.leaseTime * 60000).toISOString(),
+    expiresAt: new Date(now + leaseTimeMinutes * 60000).toISOString(),
     status
   };
   if (idx >= 0) leases[idx] = record; else leases.push(record);
@@ -787,8 +821,9 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
   const existingLease = leases.find(l => normalizeMac(l.mac) === mac && l.id !== 'host-pc-self');
   const hostname = parsedHostname || existingLease?.hostname || `Device-${requestedIp.split(".")[3]}`;
 
-  upsertLease(mac, requestedIp, hostname, isReservedForThisMac ? 'reserved' : 'active');
-  logDhcp('SUCCESS', `DHCPREQUEST 수신: MAC ${mac} → DHCPACK ${requestedIp} 전송 (${hostname}, ${dhcpConfig.leaseTime}분 임대)`);
+  const requestOpts = getDhcpOptionsForIp(requestedIp);
+  upsertLease(mac, requestedIp, hostname, isReservedForThisMac ? 'reserved' : 'active', requestOpts.leaseTime);
+  logDhcp('SUCCESS', `DHCPREQUEST 수신: MAC ${mac} → DHCPACK ${requestedIp} 전송 (${hostname}, ${requestOpts.leaseTime}분 임대)`);
   sendDhcpReply(5, pkt, requestedIp);
   saveState();
 }
@@ -1778,7 +1813,7 @@ async function discoverNetworkDevices(): Promise<boolean> {
       if (existing.status === 'expired') {
         existing.status = 'active';
         existing.leasedAt = new Date().toISOString();
-        existing.expiresAt = new Date(Date.now() + dhcpConfig.leaseTime * 60000).toISOString();
+        existing.expiresAt = new Date(Date.now() + getDhcpOptionsForIp(existing.ip).leaseTime * 60000).toISOString();
         changed = true;
       }
       continue;
@@ -1792,7 +1827,7 @@ async function discoverNetworkDevices(): Promise<boolean> {
       hostname,
       interfaceName: dhcpConfig.interfaceName,
       leasedAt: new Date().toISOString(),
-      expiresAt: new Date(Date.now() + dhcpConfig.leaseTime * 60000).toISOString(),
+      expiresAt: new Date(Date.now() + getDhcpOptionsForIp(device.ip).leaseTime * 60000).toISOString(),
       status: "active"
     });
     dhcpConsoleLogs.push({
@@ -2105,7 +2140,7 @@ app.post("/api/dhcp/leases/:id/renew", async (req, res) => {
     return res.status(404).json({ error: "해당 임대 정보를 찾을 수 없습니다." });
   }
 
-  lease.expiresAt = new Date(Date.now() + dhcpConfig.leaseTime * 60000).toISOString();
+  lease.expiresAt = new Date(Date.now() + getDhcpOptionsForIp(lease.ip).leaseTime * 60000).toISOString();
 
   const resolvedHostname = await reverseDnsLookup(lease.ip);
   if (resolvedHostname && /^Device-\d+$/.test(lease.hostname)) {

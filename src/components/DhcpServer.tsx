@@ -2,7 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import {
   Server, Network, Plus, Trash2, ShieldAlert,
   HelpCircle, RefreshCw, Layers, Check, Database,
-  Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
+  Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, Clock, Wifi, User, Settings,
   Radar, X, AlertCircle, Download, ArrowUp, ArrowDown, ArrowUpDown, Upload, Pencil, Pin
 } from 'lucide-react';
 import { DhcpConfig, DhcpLease, DhcpRange, DhcpReservation, TerminalHost } from '../types';
@@ -282,18 +282,32 @@ export default function DhcpServer({
   useEffect(() => {
     setLeaseTime(config.leaseTime);
   }, [config.leaseTime]);
+  // `config` is re-fetched (and replaced wholesale) every 1.5s by the app's
+  // status poll, so config.extraRanges is a brand-new array reference on
+  // every single tick even when its actual content hasn't changed. Using it
+  // directly as a useEffect dependency made this effect re-fire every 1.5s,
+  // clobbering whatever row the admin had just added/edited locally before
+  // they got a chance to click "설정 적용" — a newly added row would vanish
+  // again within ~1.5 seconds. Depending on the serialized content instead
+  // means the effect only re-syncs when the *saved* ranges actually change.
+  const extraRangesKey = JSON.stringify(config.extraRanges || []);
   useEffect(() => {
     setExtraRanges(config.extraRanges || []);
-  }, [config.extraRanges]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [extraRangesKey]);
 
+  // New rows start as a copy of the top row's current gateway/dns/leaseTime
+  // (adapter/mask/server IP are never per-range — see DhcpRange in types.ts)
+  // so "대역 추가" produces a full row that looks and starts out identical to
+  // the one above, per request — only the address boundaries need changing.
   const handleAddExtraRange = () => {
-    setExtraRanges(prev => [...prev, { id: `range-${Date.now()}`, start: "", end: "" }]);
+    setExtraRanges(prev => [...prev, { id: `range-${Date.now()}`, start: "", end: "", gateway, dns, leaseTime }]);
   };
   const handleRemoveExtraRange = (id: string) => {
     setExtraRanges(prev => prev.filter(r => r.id !== id));
   };
-  const handleExtraRangeChange = (id: string, field: "start" | "end", value: string) => {
-    setExtraRanges(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r));
+  const handleExtraRangeChange = (id: string, field: "start" | "end" | "gateway" | "dns" | "leaseTime", value: string) => {
+    setExtraRanges(prev => prev.map(r => r.id === id ? { ...r, [field]: field === "leaseTime" ? Number(value) : value } : r));
   };
 
   // If the configured adapter isn't among the real adapters on this PC (e.g. stale
@@ -997,14 +1011,17 @@ export default function DhcpServer({
 
         {/* Additional address ranges (pools) — e.g. a /23 or /22 subnet split
             into separate, non-contiguous chunks so a block in the middle can
-            be excluded from leasing. Shares the adapter/mask/gateway/dns/
-            serverIp/leaseTime above; only the address boundaries differ per
-            row. findAvailableIp() on the backend searches every row in order. */}
-        <div className="pt-3 border-t border-slate-850/60 space-y-2">
+            be excluded from leasing. Each row mirrors the full field set of
+            the row above it: 바인딩 어댑터/서브넷 마스크/DHCP 서버 IP are
+            read-only (there's only one bound adapter and one server identity
+            — see DhcpRange in types.ts), but 게이트웨이/DNS/임대시간 are
+            independently editable per range. findAvailableIp() on the
+            backend searches every row in order. */}
+        <div className="pt-3 border-t border-slate-850/60 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <label
               className="block text-slate-400 font-bold text-[10px]"
-              title="예: /23 대역을 두 구간으로, /22 대역을 네 구간으로 나눠 등록하고 싶을 때 사용합니다. 어댑터/서브넷 마스크/게이트웨이/DNS/임대시간은 위 설정을 그대로 공유합니다."
+              title="예: /23 대역을 두 구간으로, /22 대역을 네 구간으로 나눠 등록하고 싶을 때 사용합니다. 어댑터/서브넷 마스크/서버 IP는 위 설정과 항상 동일합니다(어댑터 하나만 서비스 가능)."
             >
               추가 주소 대역 (선택 — /23, /22처럼 대역을 나눠 등록할 때 사용)
             </label>
@@ -1023,39 +1040,90 @@ export default function DhcpServer({
               추가된 대역이 없습니다. 위 대역 하나로 충분하면 비워두세요.
             </p>
           ) : (
-            <div className="space-y-2">
+            <div className="space-y-3">
               {extraRanges.map((range, idx) => (
-                <div key={range.id} className="flex items-end gap-2">
-                  <span className="text-[10px] text-slate-500 font-mono w-6 shrink-0 pb-2">#{idx + 2}</span>
-                  <div className="flex-1">
-                    <label className="block text-slate-500 text-[9px] mb-0.5">시작 대역</label>
-                    <input
-                      type="text"
-                      value={range.start}
-                      onChange={(e) => handleExtraRangeChange(range.id, 'start', e.target.value)}
-                      placeholder="192.168.4.10"
-                      className="w-full bg-slate-950 border border-slate-850 rounded-lg p-1.5 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
-                    />
+                <div key={range.id} className="p-2.5 bg-slate-950/40 border border-slate-850/60 rounded-xl space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[9px] text-slate-500 font-mono font-bold">대역 #{idx + 2}</span>
+                    <button
+                      type="button"
+                      onClick={() => handleRemoveExtraRange(range.id)}
+                      className="text-slate-400 hover:text-rose-400 p-1 rounded cursor-pointer transition"
+                      title="이 대역 삭제"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </div>
-                  <ArrowRight className="w-3 h-3 text-slate-600 mb-2 shrink-0" />
-                  <div className="flex-1">
-                    <label className="block text-slate-500 text-[9px] mb-0.5">종료 대역</label>
-                    <input
-                      type="text"
-                      value={range.end}
-                      onChange={(e) => handleExtraRangeChange(range.id, 'end', e.target.value)}
-                      placeholder="192.168.5.250"
-                      className="w-full bg-slate-950 border border-slate-850 rounded-lg p-1.5 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
-                    />
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end text-xs">
+                    <div>
+                      <label className="block text-slate-500 font-bold mb-1 text-[10px] truncate" title="어댑터는 위 설정과 항상 동일합니다 — 하나의 어댑터에서만 서비스할 수 있습니다.">바인딩 어댑터</label>
+                      <div className="w-full bg-slate-900 border border-slate-850 rounded-lg p-2 text-slate-400 font-sans text-[11px] truncate" title={interfaceName}>
+                        {interfaceName}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">시작 대역</label>
+                      <input
+                        type="text"
+                        value={range.start}
+                        onChange={(e) => handleExtraRangeChange(range.id, 'start', e.target.value)}
+                        placeholder="192.168.4.10"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">종료 대역</label>
+                      <input
+                        type="text"
+                        value={range.end}
+                        onChange={(e) => handleExtraRangeChange(range.id, 'end', e.target.value)}
+                        placeholder="192.168.5.250"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-500 font-bold mb-1 text-[10px] truncate" title="서브넷 마스크는 위 설정과 항상 동일합니다 — 같은 물리 서브넷을 나눠 쓰는 대역이기 때문입니다.">서브넷 마스크</label>
+                      <div className="w-full bg-slate-900 border border-slate-850 rounded-lg p-2 text-slate-400 font-mono text-[11px] truncate" title={subnetMask}>
+                        {subnetMask}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-slate-500 font-bold mb-1 text-[10px] truncate" title="DHCP 서버 IP는 위 설정과 항상 동일합니다 — 이 서버 자신을 식별하는 단일 주소이기 때문입니다.">DHCP 서버 IP</label>
+                      <div className="w-full bg-slate-900 border border-slate-850 rounded-lg p-2 text-slate-400 font-mono text-[11px] truncate" title={serverIp || '자동'}>
+                        {serverIp || '자동'}
+                      </div>
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">기본 게이트웨이</label>
+                      <input
+                        type="text"
+                        value={range.gateway ?? ''}
+                        onChange={(e) => handleExtraRangeChange(range.id, 'gateway', e.target.value)}
+                        placeholder={gateway}
+                        className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">기본 DNS 서버</label>
+                      <input
+                        type="text"
+                        value={range.dns ?? ''}
+                        onChange={(e) => handleExtraRangeChange(range.id, 'dns', e.target.value)}
+                        placeholder={dns}
+                        className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">임대 시간 (분)</label>
+                      <input
+                        type="number"
+                        value={range.leaseTime ?? leaseTime}
+                        onChange={(e) => handleExtraRangeChange(range.id, 'leaseTime', e.target.value)}
+                        min="1"
+                        className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                      />
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleRemoveExtraRange(range.id)}
-                    className="shrink-0 text-slate-400 hover:text-rose-400 p-2 rounded-lg border border-slate-850 bg-slate-950 cursor-pointer transition"
-                    title="이 대역 삭제"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
                 </div>
               ))}
             </div>
@@ -1074,7 +1142,9 @@ export default function DhcpServer({
               IP 사용 현황
             </h3>
             <p className="text-[10px] text-slate-400 mt-0.5">
-              IP 임대 풀(<strong className="text-emerald-400 font-mono">{rangeStart} ~ {rangeEnd}</strong>) 점유/여유 현황입니다.
+              IP 임대 풀(<strong className="text-emerald-400 font-mono">
+                {[{ start: rangeStart, end: rangeEnd }, ...extraRanges].map(r => `${r.start}~${r.end}`).join(', ')}
+              </strong>) 점유/여유 현황입니다.
             </p>
           </div>
 
