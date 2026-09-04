@@ -5,7 +5,7 @@ import {
   Search, Monitor, Laptop, Cpu, Printer, LayoutGrid, List, ArrowRight, Clock, Wifi, User, Settings,
   Radar, X, AlertCircle, Download, ArrowUp, ArrowDown, ArrowUpDown, Upload, Pencil, Pin
 } from 'lucide-react';
-import { DhcpConfig, DhcpLease, DhcpReservation, TerminalHost } from '../types';
+import { DhcpConfig, DhcpLease, DhcpRange, DhcpReservation, TerminalHost } from '../types';
 
 interface DhcpServerProps {
   dhcpRunning: boolean;
@@ -24,7 +24,7 @@ interface DhcpServerProps {
   onUpdateReservation: (id: string, mac: string, ip: string, hostname: string) => Promise<{ success: boolean; error?: string }>;
   onBulkImportReservations: (rows: { mac: string; ip: string; hostname: string }[]) => Promise<{ imported: number; skipped: { row: any; reason: string }[] } | void>;
   onRemoveReservation: (id: string) => void;
-  onClearLeases: () => void;
+  onClearLeases: () => Promise<{ success: boolean; error?: string }>;
   onRemoveLease: (id: string) => void;
   onRenewLease: (id: string) => void;
   onRefreshDiscovery: () => void;
@@ -71,6 +71,12 @@ export default function DhcpServer({
   const [serverIp, setServerIp] = useState(config.serverIp || "");
   const [dns, setDns] = useState(config.dns);
   const [leaseTime, setLeaseTime] = useState(config.leaseTime);
+  // Additional address ranges (pools) on top of rangeStart-rangeEnd above —
+  // lets a /23 or /22 subnet be split into separate address chunks (e.g. to
+  // exclude a block in the middle) instead of one big contiguous range that
+  // the IP usage map can't render correctly. All rows share the adapter/
+  // mask/gateway/dns/serverIp/leaseTime above; only start/end differ.
+  const [extraRanges, setExtraRanges] = useState<DhcpRange[]>(config.extraRanges || []);
 
   // Advanced filters for Leases
   const [searchTerm, setSearchTerm] = useState("");
@@ -112,50 +118,73 @@ export default function DhcpServer({
     </th>
   );
 
+  // 32-bit IP<->int conversion done with plain arithmetic (not bitwise ops,
+  // which in JS are 32-bit *signed* and misbehave once an octet pushes the
+  // value past 2^31, e.g. anything in 128.x.x.x or above) — same approach as
+  // ipSortValue above.
+  const ipToInt = (ip: string): number => {
+    const p = ip.split(".").map(Number);
+    if (p.length !== 4 || p.some(n => Number.isNaN(n) || n < 0 || n > 255)) return NaN;
+    return ((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3];
+  };
+  const intToIp = (n: number): string =>
+    [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256].join(".");
+
   const getIpStatusMap = () => {
     try {
-      const startParts = rangeStart.split(".");
-      const endParts = rangeEnd.split(".");
-      if (startParts.length !== 4 || endParts.length !== 4) return [];
-      
-      const startOctet = parseInt(startParts[3]);
-      const endOctet = parseInt(endParts[3]);
-      const baseIp = `${startParts[0]}.${startParts[1]}.${startParts[2]}.`;
-      
-      if (isNaN(startOctet) || isNaN(endOctet) || startOctet > endOctet) return [];
-      
-      // Limit to max 150 cells for display safety
-      const limit = Math.min(endOctet - startOctet + 1, 150);
-      const ipList = [];
-      
-      for (let i = 0; i < limit; i++) {
-        const currentOctet = startOctet + i;
-        const currentIp = `${baseIp}${currentOctet}`;
-        
-        // Find if leased or reserved
-        const lease = leases.find(l => l.ip === currentIp);
-        const reservation = reservations.find(r => r.ip === currentIp);
-        
-        let status: 'leased' | 'reserved' | 'self' | 'available' = 'available';
-        let hostname = '미할당';
-        let online: boolean | undefined = undefined;
+      // Was single-range only, and assumed rangeStart/rangeEnd shared the
+      // same first 3 octets (baseIp taken from rangeStart, iterating only the
+      // last octet) — a /23 or /22 pool spans multiple third octets, so the
+      // map silently rendered the wrong addresses (or none past the first
+      // /24) whenever a range crossed that boundary. Now handles any number
+      // of ranges, each as a proper 32-bit span.
+      const ranges = [{ start: rangeStart, end: rangeEnd }, ...extraRanges]
+        .map(r => ({ startInt: ipToInt(r.start), endInt: ipToInt(r.end) }))
+        .filter(r => !Number.isNaN(r.startInt) && !Number.isNaN(r.endInt) && r.startInt <= r.endInt);
+      if (ranges.length === 0) return [];
 
-        if (lease) {
-          status = lease.id === 'host-pc-self' ? 'self' : 'leased';
-          hostname = lease.hostname;
-          online = lease.online;
-        } else if (reservation) {
-          status = 'reserved';
-          hostname = `${reservation.hostname} (예약)`;
+      // If every range lives in the same /24-ish block, keep the familiar
+      // short ".123" cell label; otherwise (e.g. a split /23) show the 3rd+4th
+      // octets so cells from different blocks stay distinguishable.
+      const blockOf = (n: number) => Math.floor(n / 256);
+      const firstBlock = blockOf(ranges[0].startInt);
+      const allSameBlock = ranges.every(r => blockOf(r.startInt) === firstBlock && blockOf(r.endInt) === firstBlock);
+
+      // Limit to max 300 cells (combined across all ranges) for display safety
+      const CELL_LIMIT = 300;
+      const ipList: { ip: string; label: string; status: 'leased' | 'reserved' | 'self' | 'available'; hostname: string; online?: boolean }[] = [];
+
+      rangeLoop:
+      for (const { startInt, endInt } of ranges) {
+        for (let cur = startInt; cur <= endInt; cur++) {
+          if (ipList.length >= CELL_LIMIT) break rangeLoop;
+          const currentIp = intToIp(cur);
+
+          // Find if leased or reserved
+          const lease = leases.find(l => l.ip === currentIp);
+          const reservation = reservations.find(r => r.ip === currentIp);
+
+          let status: 'leased' | 'reserved' | 'self' | 'available' = 'available';
+          let hostname = '미할당';
+          let online: boolean | undefined = undefined;
+
+          if (lease) {
+            status = lease.id === 'host-pc-self' ? 'self' : 'leased';
+            hostname = lease.hostname;
+            online = lease.online;
+          } else if (reservation) {
+            status = 'reserved';
+            hostname = `${reservation.hostname} (예약)`;
+          }
+
+          ipList.push({
+            ip: currentIp,
+            label: allSameBlock ? `.${cur % 256}` : `${Math.floor(cur / 256) % 256}.${cur % 256}`,
+            status,
+            hostname,
+            online
+          });
         }
-
-        ipList.push({
-          ip: currentIp,
-          octet: currentOctet,
-          status,
-          hostname,
-          online
-        });
       }
       return ipList;
     } catch (e) {
@@ -253,6 +282,19 @@ export default function DhcpServer({
   useEffect(() => {
     setLeaseTime(config.leaseTime);
   }, [config.leaseTime]);
+  useEffect(() => {
+    setExtraRanges(config.extraRanges || []);
+  }, [config.extraRanges]);
+
+  const handleAddExtraRange = () => {
+    setExtraRanges(prev => [...prev, { id: `range-${Date.now()}`, start: "", end: "" }]);
+  };
+  const handleRemoveExtraRange = (id: string) => {
+    setExtraRanges(prev => prev.filter(r => r.id !== id));
+  };
+  const handleExtraRangeChange = (id: string, field: "start" | "end", value: string) => {
+    setExtraRanges(prev => prev.map(r => r.id === id ? { ...r, [field]: value } : r));
+  };
 
   // If the configured adapter isn't among the real adapters on this PC (e.g. stale
   // config from a different machine), fall back to the first real adapter so the
@@ -285,6 +327,9 @@ export default function DhcpServer({
         // A custom server IP typed for the previous adapter wouldn't apply
         // to this one — back to "auto" until the admin sets a new one.
         setServerIp("");
+        // Same reasoning for extra ranges: address chunks carved out of the
+        // old adapter's subnet make no sense on a different one.
+        setExtraRanges([]);
       }
     }
   };
@@ -313,7 +358,10 @@ export default function DhcpServer({
         gateway,
         serverIp: serverIp.trim(),
         dns,
-        leaseTime: Number(leaseTime)
+        leaseTime: Number(leaseTime),
+        // Drop rows the admin added but never filled in, rather than saving
+        // a half-empty range that findAvailableIp() would just skip anyway.
+        extraRanges: extraRanges.filter(r => r.start.trim() && r.end.trim())
       });
       if (result?.success === false) {
         setFeedback({ type: 'error', message: result.error || 'DHCP 설정 적용에 실패했습니다.' });
@@ -324,6 +372,20 @@ export default function DhcpServer({
       setFeedback({ type: 'error', message: '설정을 적용하는 중 오류가 발생했습니다.' });
     } finally {
       setSavingConfig(false);
+    }
+  };
+
+  // Previously fired onClearLeases with no feedback at all on success or
+  // failure — a failed request (session expired, network error) looked
+  // identical to a successful one from the button's perspective, so it
+  // appeared to "do nothing" when it silently failed. Now routed through the
+  // same feedback banner used by save-config/toggle.
+  const handleClearLeasesClick = async () => {
+    const result = await onClearLeases();
+    if (result?.success === false) {
+      setFeedback({ type: 'error', message: result.error || '임대 목록을 비우는 데 실패했습니다.' });
+    } else {
+      setFeedback({ type: 'success', message: '임대 목록을 비웠습니다. (고정 예약은 유지됩니다)' });
     }
   };
 
@@ -932,6 +994,73 @@ export default function DhcpServer({
             </button>
           </div>
         </div>
+
+        {/* Additional address ranges (pools) — e.g. a /23 or /22 subnet split
+            into separate, non-contiguous chunks so a block in the middle can
+            be excluded from leasing. Shares the adapter/mask/gateway/dns/
+            serverIp/leaseTime above; only the address boundaries differ per
+            row. findAvailableIp() on the backend searches every row in order. */}
+        <div className="pt-3 border-t border-slate-850/60 space-y-2">
+          <div className="flex items-center justify-between gap-2">
+            <label
+              className="block text-slate-400 font-bold text-[10px]"
+              title="예: /23 대역을 두 구간으로, /22 대역을 네 구간으로 나눠 등록하고 싶을 때 사용합니다. 어댑터/서브넷 마스크/게이트웨이/DNS/임대시간은 위 설정을 그대로 공유합니다."
+            >
+              추가 주소 대역 (선택 — /23, /22처럼 대역을 나눠 등록할 때 사용)
+            </label>
+            <button
+              type="button"
+              id="add-extra-range-btn"
+              onClick={handleAddExtraRange}
+              className="text-[10px] text-indigo-400 hover:text-indigo-300 flex items-center gap-1 cursor-pointer shrink-0"
+            >
+              <Plus className="w-3 h-3" /> 대역 추가
+            </button>
+          </div>
+
+          {extraRanges.length === 0 ? (
+            <p className="text-[10px] text-slate-500">
+              추가된 대역이 없습니다. 위 대역 하나로 충분하면 비워두세요.
+            </p>
+          ) : (
+            <div className="space-y-2">
+              {extraRanges.map((range, idx) => (
+                <div key={range.id} className="flex items-end gap-2">
+                  <span className="text-[10px] text-slate-500 font-mono w-6 shrink-0 pb-2">#{idx + 2}</span>
+                  <div className="flex-1">
+                    <label className="block text-slate-500 text-[9px] mb-0.5">시작 대역</label>
+                    <input
+                      type="text"
+                      value={range.start}
+                      onChange={(e) => handleExtraRangeChange(range.id, 'start', e.target.value)}
+                      placeholder="192.168.4.10"
+                      className="w-full bg-slate-950 border border-slate-850 rounded-lg p-1.5 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                    />
+                  </div>
+                  <ArrowRight className="w-3 h-3 text-slate-600 mb-2 shrink-0" />
+                  <div className="flex-1">
+                    <label className="block text-slate-500 text-[9px] mb-0.5">종료 대역</label>
+                    <input
+                      type="text"
+                      value={range.end}
+                      onChange={(e) => handleExtraRangeChange(range.id, 'end', e.target.value)}
+                      placeholder="192.168.5.250"
+                      className="w-full bg-slate-950 border border-slate-850 rounded-lg p-1.5 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveExtraRange(range.id)}
+                    className="shrink-0 text-slate-400 hover:text-rose-400 p-2 rounded-lg border border-slate-850 bg-slate-950 cursor-pointer transition"
+                    title="이 대역 삭제"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
       </form>
 
       {/* Main Stack: Full-Width Stacked Cards with No Hidden Sidebars */}
@@ -1012,7 +1141,7 @@ export default function DhcpServer({
                       {hasLeaseLikeStatus && (
                         <span className={`absolute top-[1px] right-[1px] w-1 h-1 rounded-full ${onlineDotClass}`}></span>
                       )}
-                      <div className="font-bold">.{cell.octet}</div>
+                      <div className="font-bold">{cell.label}</div>
                     </div>
                   );
                 })}
@@ -1082,7 +1211,7 @@ export default function DhcpServer({
               {/* Flush leases */}
               <button
                 id="clear-leases-btn"
-                onClick={onClearLeases}
+                onClick={handleClearLeasesClick}
                 className="text-slate-400 hover:text-rose-400 border border-slate-850 bg-slate-950 p-1.5 rounded-lg text-xs cursor-pointer transition"
                 title="임대 목록 비우기"
               >

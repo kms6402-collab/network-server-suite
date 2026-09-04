@@ -12,6 +12,18 @@ export interface DhcpConfig {
   // behavior). When set, the backend adds it to the adapter as a secondary
   // IP if not already present — see ensureServerIpOnAdapter in server.ts.
   serverIp?: string;
+  // Additional address ranges within the same adapter/subnet, on top of
+  // rangeStart-rangeEnd above — e.g. a /23 or /22 pool split into separate
+  // chunks (so a block in the middle can be excluded from leasing). All
+  // ranges share the same interfaceName/subnetMask/gateway/dns/serverIp/
+  // leaseTime; only the address boundaries differ per entry.
+  extraRanges?: DhcpRange[];
+}
+
+export interface DhcpRange {
+  id: string;
+  start: string;
+  end: string;
 }
 
 export interface DhcpLease {

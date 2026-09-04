@@ -133,7 +133,8 @@ export default function App() {
     gateway: "192.168.1.1",
     dns: "8.8.8.8",
     leaseTime: 120,
-    serverIp: ""
+    serverIp: "",
+    extraRanges: []
   });
   // This host's real interface IP, as the DHCP server *actually currently*
   // identifies itself to clients (resolved server-side from dhcpConfig.serverIp
@@ -373,16 +374,19 @@ export default function App() {
     }
   };
 
-  const handleClearLeases = async () => {
+  const handleClearLeases = async (): Promise<{ success: boolean; error?: string }> => {
     try {
       const res = await fetch('/api/dhcp/leases/clear', { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setLeases(data.leases);
         setDhcpConsoleLogs(data.dhcpConsoleLogs);
+        return { success: true };
       }
+      return { success: false, error: `요청이 실패했습니다 (HTTP ${res.status}).` };
     } catch (e) {
       console.error(e);
+      return { success: false, error: '서버와 통신하는 중 오류가 발생했습니다.' };
     }
   };
 
@@ -895,7 +899,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.10.1 Enterprise
+                v2.11.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>

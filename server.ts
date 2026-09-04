@@ -110,7 +110,8 @@ let dhcpConfig: DhcpConfig = {
     : { rangeStart: "192.168.1.100", rangeEnd: "192.168.1.200", subnetMask: "255.255.255.0", gateway: "192.168.1.1" }),
   dns: "8.8.8.8",
   leaseTime: 120, // minutes
-  serverIp: "" // empty = auto (use whatever real IP the adapter already has)
+  serverIp: "", // empty = auto (use whatever real IP the adapter already has)
+  extraRanges: []
 };
 
 let leases: DhcpLease[] = [];
@@ -267,7 +268,8 @@ function loadState() {
             ...(s.gateway && { gateway: s.gateway }),
             ...(s.dns && { dns: s.dns }),
             ...(s.leaseTime && { leaseTime: Number(s.leaseTime) || dhcpConfig.leaseTime }),
-            ...(s.serverIp !== undefined && { serverIp: s.serverIp })
+            ...(s.serverIp !== undefined && { serverIp: s.serverIp }),
+            ...(s.extraRanges && { extraRanges: JSON.parse(s.extraRanges) })
           };
         }
         if (sections.TftpFtpConfig) {
@@ -369,7 +371,8 @@ function saveState() {
         gateway: dhcpConfig.gateway,
         dns: dhcpConfig.dns,
         leaseTime: String(dhcpConfig.leaseTime),
-        serverIp: dhcpConfig.serverIp || ""
+        serverIp: dhcpConfig.serverIp || "",
+        extraRanges: JSON.stringify(dhcpConfig.extraRanges || [])
       },
       TftpFtpConfig: {
         tftpEnabled: String(tftpFtpConfig.tftpEnabled),
@@ -431,8 +434,10 @@ function ensureDhcpConfigMatchesHost(): boolean {
       // A configured serverIp only means something on the adapter it was set
       // for — if the adapter itself just changed (the old one is gone from
       // this host), that value is now stale/meaningless, so clear it back to
-      // "auto" rather than carrying it over to an unrelated adapter.
-      ...(fellBackToDefaultInterface ? { serverIp: "" } : {})
+      // "auto" rather than carrying it over to an unrelated adapter. Same
+      // reasoning for extraRanges: address chunks carved out of the old
+      // adapter's subnet make no sense on a different one.
+      ...(fellBackToDefaultInterface ? { serverIp: "", extraRanges: [] } : {})
     };
     return true;
   }
@@ -522,11 +527,6 @@ function computeNetworkAddress(ip: string, mask: string): string {
 
 function isIpInSubnet(ip: string, subnetIp: string, mask: string): boolean {
   return computeNetworkAddress(ip, mask) === computeNetworkAddress(subnetIp, mask);
-}
-
-function isIpInRange(ip: string, start: string, end: string): boolean {
-  const n = ipToInt(ip);
-  return n >= ipToInt(start) && n <= ipToInt(end);
 }
 
 // --- Raw DHCP packet parsing/building (RFC 2131 BOOTP header + RFC 2132 options) ---
@@ -664,15 +664,36 @@ function sendDhcpReply(messageType: number, pkt: ParsedDhcpPacket, offeredIp: st
   });
 }
 
+// All configured address ranges as (start,end) int pairs — the primary
+// rangeStart/rangeEnd plus any extraRanges (additional pool chunks, e.g. a
+// /23 or /22 split into separate address blocks on the same subnet).
+// Invalid entries (bad format, or start > end) are silently skipped rather
+// than rejecting the whole pool.
+function getAllDhcpRanges(): { start: number; end: number }[] {
+  const raw = [{ start: dhcpConfig.rangeStart, end: dhcpConfig.rangeEnd }, ...(dhcpConfig.extraRanges || [])];
+  const ranges: { start: number; end: number }[] = [];
+  for (const r of raw) {
+    const start = ipToInt(r.start);
+    const end = ipToInt(r.end);
+    if (!isValidIPv4(r.start) || !isValidIPv4(r.end) || start > end) continue;
+    ranges.push({ start, end });
+  }
+  return ranges;
+}
+
+function isIpInAnyDhcpRange(ip: string): boolean {
+  const n = ipToInt(ip);
+  return getAllDhcpRanges().some(r => n >= r.start && n <= r.end);
+}
+
 function findAvailableIp(): string | null {
-  const start = ipToInt(dhcpConfig.rangeStart);
-  const end = ipToInt(dhcpConfig.rangeEnd);
-  if (Number.isNaN(start) || Number.isNaN(end) || start > end) return null;
   const usedIps = new Set(leases.filter(l => l.status !== 'expired').map(l => l.ip));
   const reservedIps = new Set(reservations.map(r => r.ip));
-  for (let cur = start; cur <= end; cur++) {
-    const candidate = intToIp(cur);
-    if (!usedIps.has(candidate) && !reservedIps.has(candidate)) return candidate;
+  for (const { start, end } of getAllDhcpRanges()) {
+    for (let cur = start; cur <= end; cur++) {
+      const candidate = intToIp(cur);
+      if (!usedIps.has(candidate) && !reservedIps.has(candidate)) return candidate;
+    }
   }
   return null;
 }
@@ -743,7 +764,7 @@ function handleDhcpRequest(pkt: ParsedDhcpPacket) {
 
   const reservation = reservations.find(r => normalizeMac(r.mac) === mac);
   const isReservedForThisMac = !!reservation && reservation.ip === requestedIp;
-  const inRange = isIpInRange(requestedIp, dhcpConfig.rangeStart, dhcpConfig.rangeEnd);
+  const inRange = isIpInAnyDhcpRange(requestedIp);
   const conflict = leases.find(l => l.ip === requestedIp && normalizeMac(l.mac) !== mac && l.status !== 'expired');
 
   if (conflict || (!inRange && !isReservedForThisMac)) {
@@ -1726,9 +1747,12 @@ async function discoverNetworkDevices(): Promise<boolean> {
   const hostInfo = getInterfaceInfo(dhcpConfig.interfaceName);
   if (!hostInfo) return false;
 
-  const subnetPrefix = hostInfo.ip.split(".").slice(0, 3).join(".") + ".";
+  // Was a string prefix match on the host IP's first 3 octets, which silently
+  // assumed a /24 — a /23 or /22 pool spans multiple third octets, so real
+  // devices sitting in the other half of the subnet were never discovered.
+  // isIpInSubnet() compares against the actual configured mask instead.
   const found = await scanArpTable();
-  const inSubnet = found.filter(d => d.ip.startsWith(subnetPrefix) && d.ip !== hostInfo.ip);
+  const inSubnet = found.filter(d => isIpInSubnet(d.ip, hostInfo.ip, dhcpConfig.subnetMask) && d.ip !== hostInfo.ip);
 
   let changed = false;
   for (const device of inSubnet) {
