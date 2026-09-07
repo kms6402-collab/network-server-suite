@@ -91,6 +91,12 @@ export default function TerminalAutomation({
   // filter currently leaves visible, so a filtered-down search can be used to
   // register just a specific subset of leases without hunting through the rest.
   const [leaseFilterText, setLeaseFilterText] = useState("");
+  // Same-scope as leaseFilterText above — narrows the checklist (and what
+  // "전체 선택/해제" acts on) to only online, only offline, or every lease.
+  // lease.online is undefined while a ping check hasn't completed yet; those
+  // rows are excluded from both the "online" and "offline" filters (neither
+  // is actually true yet) but always show under "전체".
+  const [leaseOnlineFilter, setLeaseOnlineFilter] = useState<'all' | 'online' | 'offline'>('all');
   const [importProtocol, setImportProtocol] = useState<'SSH' | 'TELNET'>("SSH");
   const [importPort, setImportPort] = useState(22);
   const [importUser, setImportUser] = useState("");
@@ -108,12 +114,14 @@ export default function TerminalAutomation({
   const importableLeases = leases.filter(l => l.id !== 'host-pc-self');
   const filteredImportableLeases = (() => {
     const q = leaseFilterText.trim().toLowerCase();
-    if (!q) return importableLeases;
-    return importableLeases.filter(l =>
-      (l.hostname || '').toLowerCase().includes(q) ||
-      l.ip.toLowerCase().includes(q) ||
-      l.mac.toLowerCase().includes(q)
-    );
+    return importableLeases.filter(l => {
+      if (leaseOnlineFilter === 'online' && l.online !== true) return false;
+      if (leaseOnlineFilter === 'offline' && l.online !== false) return false;
+      if (!q) return true;
+      return (l.hostname || '').toLowerCase().includes(q) ||
+        l.ip.toLowerCase().includes(q) ||
+        l.mac.toLowerCase().includes(q);
+    });
   })();
 
   // Script Form State
@@ -343,6 +351,7 @@ export default function TerminalAutomation({
     setShowDhcpImportPanel(false);
     setSelectedLeaseIds(new Set());
     setLeaseFilterText("");
+    setLeaseOnlineFilter("all");
     setImportProtocol("SSH");
     setImportPort(22);
     setImportUser("");
@@ -676,6 +685,23 @@ export default function TerminalAutomation({
                 )}
               </div>
 
+              <div className="flex items-center gap-1 bg-slate-900 border border-slate-800 rounded-lg p-0.5 text-[10px] font-bold">
+                {([
+                  { key: 'all', label: '전체' },
+                  { key: 'online', label: '온라인' },
+                  { key: 'offline', label: '오프라인' }
+                ] as const).map(opt => (
+                  <button
+                    key={opt.key}
+                    type="button"
+                    onClick={() => setLeaseOnlineFilter(opt.key)}
+                    className={`flex-1 py-1 rounded transition cursor-pointer ${leaseOnlineFilter === opt.key ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-white'}`}
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+
               <div className="flex items-center justify-between text-[10px] text-slate-400 font-bold">
                 <label className="flex items-center gap-1.5 cursor-pointer select-none">
                   <input
@@ -684,7 +710,7 @@ export default function TerminalAutomation({
                     checked={filteredImportableLeases.length > 0 && filteredImportableLeases.every(l => selectedLeaseIds.has(l.id))}
                     onChange={toggleSelectAllFilteredLeases}
                   />
-                  전체 선택/해제{leaseFilterText ? ` (필터된 ${filteredImportableLeases.length}개)` : ''}
+                  전체 선택/해제{(leaseFilterText || leaseOnlineFilter !== 'all') ? ` (필터된 ${filteredImportableLeases.length}개)` : ''}
                 </label>
                 <span>{selectedLeaseIds.size} / {importableLeases.length}개 선택됨</span>
               </div>
@@ -698,6 +724,10 @@ export default function TerminalAutomation({
                       checked={selectedLeaseIds.has(lease.id)}
                       onChange={() => toggleLeaseSelected(lease.id)}
                     />
+                    <span
+                      className={`w-1.5 h-1.5 rounded-full shrink-0 ${lease.online === undefined ? 'bg-slate-500' : lease.online ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500'}`}
+                      title={lease.online === undefined ? '온라인 상태 확인 중' : lease.online ? '온라인' : '오프라인'}
+                    ></span>
                     <span className="min-w-0 flex-1">
                       <span className="block font-bold text-white truncate" title={lease.hostname || '(unknown)'}>
                         {lease.hostname || '(unknown)'}
@@ -1405,29 +1435,34 @@ export default function TerminalAutomation({
           <div className="flex items-center gap-1.5 min-w-0 flex-1">
             <div className="flex gap-1.5 overflow-x-auto max-w-full pb-1">
               {executions.map((exec, idx) => (
-                <button
+                <div
                   id={`tab-${exec.id}`}
                   key={exec.id}
-                  onClick={() => handleSelectTab(exec.id)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold shrink-0 flex items-center gap-1.5 border cursor-pointer transition ${
+                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold shrink-0 flex items-center gap-1.5 border transition ${
                     activeTabId === exec.id
                       ? 'bg-slate-950 text-emerald-400 border-slate-700/80'
                       : 'bg-slate-900/50 text-slate-400 border-slate-850 hover:border-slate-700'
                   }`}
                 >
-                  <Terminal className="w-3.5 h-3.5" />
-                  Session-{idx + 1}
-                  <span className={`w-1.5 h-1.5 rounded-full ${exec.status === 'running' ? 'bg-amber-400 animate-ping' : exec.status === 'completed' ? 'bg-emerald-400' : 'bg-rose-500'}`}></span>
-                  <span
-                    role="button"
+                  <button
+                    type="button"
+                    onClick={() => handleSelectTab(exec.id)}
+                    className="flex items-center gap-1.5 cursor-pointer"
+                  >
+                    <Terminal className="w-3.5 h-3.5" />
+                    Session-{idx + 1}
+                    <span className={`w-1.5 h-1.5 rounded-full ${exec.status === 'running' ? 'bg-amber-400 animate-ping' : exec.status === 'completed' ? 'bg-emerald-400' : 'bg-rose-500'}`}></span>
+                  </button>
+                  <button
+                    type="button"
                     id={`close-tab-${exec.id}`}
-                    onClick={(e) => { e.stopPropagation(); onCloseSession(exec.id); }}
+                    onClick={() => onCloseSession(exec.id)}
                     className="ml-0.5 p-0.5 rounded hover:bg-rose-950/60 hover:text-rose-400 text-slate-500 cursor-pointer transition"
                     title="세션 닫기 (탭 제거)"
                   >
                     <X className="w-3 h-3" />
-                  </span>
-                </button>
+                  </button>
+                </div>
               ))}
               {executions.length === 0 && (
                 <span className="text-[11px] text-slate-500 py-1.5 font-medium">활성 자동화 세션 없음</span>

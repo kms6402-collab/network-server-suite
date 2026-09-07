@@ -24,6 +24,7 @@ interface DhcpServerProps {
   onUpdateReservation: (id: string, mac: string, ip: string, hostname: string) => Promise<{ success: boolean; error?: string }>;
   onBulkImportReservations: (rows: { mac: string; ip: string; hostname: string }[]) => Promise<{ imported: number; skipped: { row: any; reason: string }[] } | void>;
   onRemoveReservation: (id: string) => void;
+  onRemoveAllReservations: () => Promise<{ success: boolean; error?: string }>;
   onClearLeases: () => Promise<{ success: boolean; error?: string }>;
   onRemoveLease: (id: string) => void;
   onRenewLease: (id: string) => void;
@@ -44,6 +45,7 @@ export default function DhcpServer({
   onUpdateReservation,
   onBulkImportReservations,
   onRemoveReservation,
+  onRemoveAllReservations,
   onClearLeases,
   onRemoveLease,
   onRenewLease,
@@ -194,6 +196,47 @@ export default function DhcpServer({
           });
         }
       }
+
+      // A device can be leased/reserved at an IP outside every configured
+      // range (e.g. an ARP-discovered device with a static address the pool
+      // was never extended to cover) — 할당 단말 현황 shows it regardless
+      // (reads leases/reservations directly, no range filtering), so leaving
+      // it out here made that device look like it had silently vanished from
+      // this map even though it never had a cell to vanish from. Append one
+      // cell per such "orphan" IP so every assigned device always has a cell
+      // somewhere on this map.
+      const coveredIps = new Set(ipList.map(c => c.ip));
+      const orphanIps = new Set<string>();
+      for (const l of leases) if (!coveredIps.has(l.ip)) orphanIps.add(l.ip);
+      for (const r of reservations) if (!coveredIps.has(r.ip)) orphanIps.add(r.ip);
+
+      for (const ip of orphanIps) {
+        if (ipList.length >= CELL_LIMIT) break;
+        const lease = leases.find(l => l.ip === ip);
+        const reservation = reservations.find(r => r.ip === ip);
+
+        let status: 'leased' | 'reserved' | 'self' | 'available' = 'available';
+        let hostname = '미할당';
+        let online: boolean | undefined = undefined;
+        if (lease) {
+          status = lease.id === 'host-pc-self' ? 'self' : 'leased';
+          hostname = lease.hostname;
+          online = lease.online;
+        } else if (reservation) {
+          status = 'reserved';
+          hostname = `${reservation.hostname} (예약)`;
+        }
+
+        ipList.push({
+          ip,
+          label: ip, // full IP (not just the last octet) — it may sit far outside the configured pool block
+          status,
+          hostname,
+          online,
+          excluded: excludedSet.has(ip)
+        });
+      }
+
       return ipList;
     } catch (e) {
       return [];
@@ -408,6 +451,19 @@ export default function DhcpServer({
       setFeedback({ type: 'error', message: result.error || '임대 목록을 비우는 데 실패했습니다.' });
     } else {
       setFeedback({ type: 'success', message: '임대 목록을 비웠습니다. (고정 예약은 유지됩니다)' });
+    }
+  };
+
+  // Destructive + irreversible (unlike clearing dynamic leases above, this
+  // actually deletes the reservations themselves) — confirm before sending.
+  const handleRemoveAllReservationsClick = async () => {
+    if (reservations.length === 0) return;
+    if (!window.confirm(`고정 IP 예약 ${reservations.length}건을 모두 삭제하시겠습니까? 되돌릴 수 없습니다.`)) return;
+    const result = await onRemoveAllReservations();
+    if (result?.success === false) {
+      setFeedback({ type: 'error', message: result.error || '고정 IP 예약을 삭제하는 데 실패했습니다.' });
+    } else {
+      setFeedback({ type: 'success', message: '모든 고정 IP 예약을 삭제했습니다.' });
     }
   };
 
@@ -1608,6 +1664,18 @@ export default function DhcpServer({
               </h3>
               <p className="text-[10px] text-slate-400 mt-0.5">MAC 주소별로 항상 동일한 고정 IP를 부여합니다.</p>
             </div>
+            {reservations.length > 0 && (
+              <button
+                type="button"
+                id="remove-all-reservations-btn"
+                onClick={handleRemoveAllReservationsClick}
+                className="text-rose-400 hover:text-rose-300 text-xs font-bold flex items-center gap-1 cursor-pointer transition shrink-0"
+                title="등록된 모든 고정 IP 예약을 삭제합니다."
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                전체 삭제 ({reservations.length}개)
+              </button>
+            )}
             <button
               type="button"
               id="csv-import-reservations-btn"

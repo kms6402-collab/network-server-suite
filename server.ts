@@ -233,6 +233,20 @@ function loadState() {
       if (data.transferLogs) transferLogs = data.transferLogs;
       if (data.terminalHosts) terminalHosts = data.terminalHosts;
       if (data.commandScripts) commandScripts = data.commandScripts;
+      // A 'running' execution (or one with sessionOpen: true) from the
+      // previous process lifetime is stale the moment the process restarts —
+      // liveSessions (the actual SSH/Telnet connections) is in-memory only
+      // and never persisted, so there is nothing left to finish that session.
+      // Left as 'running' it would sit stuck forever (nothing will ever
+      // move it to completed/failed again), so migrate it to 'failed' with a
+      // note explaining why, same as a real connection drop would log.
+      if (data.scriptExecutions) {
+        scriptExecutions = (data.scriptExecutions as ScriptExecution[]).map(e =>
+          (e.status === 'running' || e.sessionOpen)
+            ? { ...e, status: 'failed' as const, sessionOpen: false, logs: [...e.logs, `[${nowStr()}] [복구] 서버가 재시작되어 이 세션의 연결이 끊어졌습니다.`] }
+            : e
+        );
+      }
       if (data.batchJobs) batchJobs = data.batchJobs;
       if (data.dhcpConsoleLogs) dhcpConsoleLogs = data.dhcpConsoleLogs;
 
@@ -355,6 +369,7 @@ function saveState() {
       transferLogs,
       terminalHosts,
       commandScripts,
+      scriptExecutions,
       batchJobs,
       dhcpConsoleLogs
     };
@@ -2133,6 +2148,26 @@ app.delete("/api/dhcp/reservations/:id", (req, res) => {
   res.json({ success: true, reservations, leases, dhcpConsoleLogs });
 });
 
+// Bulk-clear every static reservation at once ("전체 삭제" in the 고정 IP
+// 예약 panel) — same per-reservation cleanup as the single-delete route
+// above (drop the paired lease record too), just for all of them together
+// instead of one at a time.
+app.delete("/api/dhcp/reservations", (req, res) => {
+  const removedMacs = new Set(reservations.map(r => normalizeMac(r.mac)));
+  const removedCount = reservations.length;
+  reservations = [];
+  leases = leases.filter(l => !removedMacs.has(normalizeMac(l.mac)));
+  if (removedCount > 0) {
+    dhcpConsoleLogs.push({
+      timestamp: new Date().toISOString(),
+      level: 'INFO',
+      message: `모든 고정 IP 예약을 삭제했습니다 (${removedCount}건).`
+    });
+    saveState();
+  }
+  res.json({ success: true, reservations, leases, dhcpConsoleLogs });
+});
+
 // Clear Lease Table
 app.post("/api/dhcp/leases/clear", (req, res) => {
   leases = leases.filter(l => l.status === 'reserved'); // Keep reservations
@@ -3183,18 +3218,27 @@ async function runBatchOrchestration(run: BatchRun) {
         sessionOpen: false
       };
       scriptExecutions.push(execution);
-      saveState();
 
       // Waits for this host's script to actually finish (or fail) before the
       // worker moves on to its next claimed host — runScriptExecution only
       // resolves once the commands have been sent and status is settled.
+      // Not calling saveState() around this dispatch (or again right after)
+      // is deliberate: runScriptExecution() already does exactly one
+      // synchronous full-state write in its own `finally` block once this
+      // host settles, which is the same write these would have duplicated.
+      // saveState() is a blocking fs.writeFileSync of the *entire* app
+      // state — at concurrency 10-20 that's up to 2x as many multi-hundred-
+      // KB blocking writes fighting over the single-threaded event loop
+      // (which also has to service every other host's SSH/Telnet socket
+      // events), directly slowing down a many-host batch. See
+      // logTransferStart's comment above for the same reasoning applied to
+      // TFTP transfers.
       await runScriptExecution(execId, host, script).catch(err => {
         console.error(`Batch execution ${execId} failed unexpectedly`, err);
       });
 
       const finished = scriptExecutions.find(e => e.id === execId);
       result.status = finished?.status === 'failed' ? 'failed' : 'completed';
-      saveState();
     }
   };
 

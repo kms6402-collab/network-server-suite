@@ -395,6 +395,23 @@ export default function App() {
     }
   };
 
+  const handleRemoveAllReservations = async (): Promise<{ success: boolean; error?: string }> => {
+    try {
+      const res = await fetch('/api/dhcp/reservations', { method: 'DELETE' });
+      if (res.ok) {
+        const data = await res.json();
+        setReservations(data.reservations);
+        setLeases(data.leases);
+        setDhcpConsoleLogs(data.dhcpConsoleLogs);
+        return { success: true };
+      }
+      return { success: false, error: `요청이 실패했습니다 (HTTP ${res.status}).` };
+    } catch (e) {
+      console.error(e);
+      return { success: false, error: '서버와 통신하는 중 오류가 발생했습니다.' };
+    }
+  };
+
   const handleClearLeases = async (): Promise<{ success: boolean; error?: string }> => {
     try {
       const res = await fetch('/api/dhcp/leases/clear', { method: 'POST' });
@@ -952,7 +969,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.14.0 Enterprise
+                v2.15.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -1063,6 +1080,7 @@ export default function App() {
                 onUpdateReservation={handleUpdateReservation}
                 onBulkImportReservations={handleBulkImportReservations}
                 onRemoveReservation={handleRemoveReservation}
+                onRemoveAllReservations={handleRemoveAllReservations}
                 onClearLeases={handleClearLeases}
                 onRemoveLease={handleRemoveLease}
                 onRenewLease={handleRenewLease}
