@@ -113,7 +113,8 @@ let dhcpConfig: DhcpConfig = {
   dns: "8.8.8.8",
   leaseTime: 120, // minutes
   serverIp: "", // empty = auto (use whatever real IP the adapter already has)
-  extraRanges: []
+  extraRanges: [],
+  excludedIps: []
 };
 
 let leases: DhcpLease[] = [];
@@ -278,7 +279,8 @@ function loadState() {
             ...(s.dns && { dns: s.dns }),
             ...(s.leaseTime && { leaseTime: Number(s.leaseTime) || dhcpConfig.leaseTime }),
             ...(s.serverIp !== undefined && { serverIp: s.serverIp }),
-            ...(s.extraRanges && { extraRanges: JSON.parse(s.extraRanges) })
+            ...(s.extraRanges && { extraRanges: JSON.parse(s.extraRanges) }),
+            ...(s.excludedIps && { excludedIps: JSON.parse(s.excludedIps) })
           };
         }
         if (sections.TftpFtpConfig) {
@@ -381,7 +383,8 @@ function saveState() {
         dns: dhcpConfig.dns,
         leaseTime: String(dhcpConfig.leaseTime),
         serverIp: dhcpConfig.serverIp || "",
-        extraRanges: JSON.stringify(dhcpConfig.extraRanges || [])
+        extraRanges: JSON.stringify(dhcpConfig.extraRanges || []),
+        excludedIps: JSON.stringify(dhcpConfig.excludedIps || [])
       },
       TftpFtpConfig: {
         tftpEnabled: String(tftpFtpConfig.tftpEnabled),
@@ -444,9 +447,9 @@ function ensureDhcpConfigMatchesHost(): boolean {
       // for — if the adapter itself just changed (the old one is gone from
       // this host), that value is now stale/meaningless, so clear it back to
       // "auto" rather than carrying it over to an unrelated adapter. Same
-      // reasoning for extraRanges: address chunks carved out of the old
-      // adapter's subnet make no sense on a different one.
-      ...(fellBackToDefaultInterface ? { serverIp: "", extraRanges: [] } : {})
+      // reasoning for extraRanges/excludedIps: address chunks and exclusions
+      // carved out of the old adapter's subnet make no sense on a different one.
+      ...(fellBackToDefaultInterface ? { serverIp: "", extraRanges: [], excludedIps: [] } : {})
     };
     return true;
   }
@@ -704,10 +707,11 @@ function getDhcpOptionsForIp(ip: string): { gateway: string; dns: string; leaseT
 function findAvailableIp(): string | null {
   const usedIps = new Set(leases.filter(l => l.status !== 'expired').map(l => l.ip));
   const reservedIps = new Set(reservations.map(r => r.ip));
+  const excludedIps = new Set(dhcpConfig.excludedIps || []);
   for (const { start, end } of getAllDhcpRanges()) {
     for (let cur = start; cur <= end; cur++) {
       const candidate = intToIp(cur);
-      if (!usedIps.has(candidate) && !reservedIps.has(candidate)) return candidate;
+      if (!usedIps.has(candidate) && !reservedIps.has(candidate) && !excludedIps.has(candidate)) return candidate;
     }
   }
   return null;
@@ -1740,6 +1744,33 @@ app.post("/api/dhcp/config", async (req, res) => {
   res.json({ success: true, dhcpConfig, dhcpServerIp: getCurrentDhcpServerIp(), leases, dhcpConsoleLogs });
 });
 
+// Toggle a single IP in/out of the exclusion list from the "IP 사용 현황"
+// map's per-cell checkbox — a lighter-weight action than the full config
+// form, so it takes effect immediately without an explicit "설정 적용".
+// Only affects future findAvailableIp() offers; a device already using the
+// IP keeps it (same "exclusion range" behavior as most DHCP servers).
+app.post("/api/dhcp/excluded-ips/toggle", (req, res) => {
+  const { ip } = req.body;
+  if (!isValidIPv4(ip)) {
+    return res.status(400).json({ error: "IP 주소 형식이 올바르지 않습니다." });
+  }
+
+  const current = dhcpConfig.excludedIps || [];
+  const excluded = current.includes(ip);
+  dhcpConfig = {
+    ...dhcpConfig,
+    excludedIps: excluded ? current.filter(e => e !== ip) : [...current, ip]
+  };
+
+  dhcpConsoleLogs.push({
+    timestamp: new Date().toISOString(),
+    level: 'INFO',
+    message: excluded ? `DHCP 할당 제외를 해제했습니다: ${ip}` : `DHCP 할당에서 제외했습니다: ${ip}`
+  });
+  saveState();
+  res.json({ success: true, dhcpConfig });
+});
+
 // Parse the OS `arp -a` table to discover real devices currently visible on the LAN.
 // This is not a real DHCP server (no DORA protocol handling) — it surfaces devices
 // the host has actually exchanged traffic with recently, which is what a lightweight,
@@ -2058,14 +2089,20 @@ app.put("/api/dhcp/reservations/:id", (req, res) => {
     return res.status(400).json({ error: `IP ${ip}는 이미 다른 MAC 주소로 예약되어 있습니다.` });
   }
 
+  const existingLease = leases.find(l => normalizeMac(l.mac) === normalizeMac(existing.mac) && l.id !== "host-pc-self");
   reservations = reservations.filter(r => r.id !== id);
   leases = leases.filter(l => normalizeMac(l.mac) !== normalizeMac(existing.mac) || l.id === "host-pc-self");
 
   const updated = upsertReservation(mac, ip, hostname);
   if (!updated) {
     // Already checked for conflicts above, but restore rather than silently
-    // dropping the entry if something still went wrong.
+    // dropping the entry if something still went wrong — both sides: a
+    // reservation restored without its paired lease used to leave the
+    // device showing as "예약중" on the IP 사용 현황 map (reads
+    // `reservations`) while missing entirely from 할당 단말 현황 (reads
+    // `leases`), with no way back except deleting and re-adding it.
     reservations.push(existing);
+    if (existingLease) leases.push(existingLease);
     return res.status(400).json({ error: `IP ${ip}는 이미 다른 MAC 주소로 예약되어 있습니다.` });
   }
 
@@ -2122,6 +2159,18 @@ app.delete("/api/dhcp/leases/:id", (req, res) => {
   const lease = leases.find(l => l.id === id);
   if (!lease) {
     return res.status(404).json({ error: "해당 임대 정보를 찾을 수 없습니다." });
+  }
+
+  // A 'reserved' lease is the paired record upsertReservation() creates for a
+  // static reservation (see there) — deleting only this side left the
+  // reservation itself still in `reservations` (so it kept showing up as
+  // "예약중" in the IP 사용 현황 map, since that reads `reservations`
+  // directly) while the device vanished from 할당 단말 현황 (which reads
+  // `leases` only), with no way to bring it back except re-adding the
+  // reservation. Removing a reservation belongs to the "예약 관리" panel
+  // (DELETE /api/dhcp/reservations/:id), which correctly clears both sides.
+  if (lease.status === 'reserved') {
+    return res.status(400).json({ error: "고정 예약된 IP입니다. 예약을 해제하려면 '예약 관리'에서 삭제하세요." });
   }
 
   leases = leases.filter(l => l.id !== id);

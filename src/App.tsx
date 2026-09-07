@@ -297,6 +297,23 @@ export default function App() {
     }
   };
 
+  // Toggle a single IP's DHCP-exclusion from the "IP 사용 현황" map's
+  // checkbox — a lighter action than the full config form, takes effect
+  // immediately.
+  const handleToggleExcludedIp = async (ip: string) => {
+    try {
+      const res = await fetch('/api/dhcp/excluded-ips/toggle', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ip })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDhcpConfig(data.dhcpConfig);
+      }
+    } catch (e) { console.error(e); }
+  };
+
   // DHCP static reservation
   const handleAddReservation = async (mac: string, ip: string, hostname: string) => {
     try {
@@ -935,7 +952,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.13.0 Enterprise
+                v2.14.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -1041,6 +1058,7 @@ export default function App() {
                 terminalHosts={terminalHosts}
                 onToggleDhcp={(enabled) => handleToggleService('DHCP', enabled)}
                 onUpdateConfig={handleUpdateDhcpConfig}
+                onToggleExcludedIp={handleToggleExcludedIp}
                 onAddReservation={handleAddReservation}
                 onUpdateReservation={handleUpdateReservation}
                 onBulkImportReservations={handleBulkImportReservations}

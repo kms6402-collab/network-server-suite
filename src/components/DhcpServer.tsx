@@ -28,6 +28,7 @@ interface DhcpServerProps {
   onRemoveLease: (id: string) => void;
   onRenewLease: (id: string) => void;
   onRefreshDiscovery: () => void;
+  onToggleExcludedIp: (ip: string) => void;
 }
 
 export default function DhcpServer({
@@ -46,7 +47,8 @@ export default function DhcpServer({
   onClearLeases,
   onRemoveLease,
   onRenewLease,
-  onRefreshDiscovery
+  onRefreshDiscovery,
+  onToggleExcludedIp
 }: DhcpServerProps) {
   // Feedback banner for "설정 적용" (save config) and service toggle actions —
   // both were previously silent on both success and failure.
@@ -152,7 +154,8 @@ export default function DhcpServer({
 
       // Limit to max 300 cells (combined across all ranges) for display safety
       const CELL_LIMIT = 300;
-      const ipList: { ip: string; label: string; status: 'leased' | 'reserved' | 'self' | 'available'; hostname: string; online?: boolean }[] = [];
+      const excludedSet = new Set(config.excludedIps || []);
+      const ipList: { ip: string; label: string; status: 'leased' | 'reserved' | 'self' | 'available'; hostname: string; online?: boolean; excluded: boolean }[] = [];
 
       rangeLoop:
       for (const { startInt, endInt } of ranges) {
@@ -182,7 +185,12 @@ export default function DhcpServer({
             label: allSameBlock ? `.${cur % 256}` : `${Math.floor(cur / 256) % 256}.${cur % 256}`,
             status,
             hostname,
-            online
+            online,
+            // Excluding an IP already in use doesn't evict it — it only
+            // blocks *future* offers (see findAvailableIp on the backend) —
+            // so this is layered as its own flag rather than a status value,
+            // independent of whatever the cell's lease/reservation state is.
+            excluded: excludedSet.has(currentIp)
           });
         }
       }
@@ -1166,6 +1174,10 @@ export default function DhcpServer({
               <span className="w-2 h-2 rounded bg-slate-800/40 border border-slate-700/40"></span>
               <span>여유</span>
             </div>
+            <div className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded bg-slate-800/40 border border-dashed border-rose-500/70"></span>
+              <span>DHCP 할당 제외 (체크박스로 지정)</span>
+            </div>
             <div className="flex items-center gap-1.5 ml-auto">
               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
               <span>온라인</span>
@@ -1201,13 +1213,26 @@ export default function DhcpServer({
                     ? "bg-slate-500"
                     : cell.online ? "bg-emerald-400 animate-pulse" : "bg-rose-500";
                   const onlineLabel = cell.online === undefined ? "확인 중" : cell.online ? "온라인" : "오프라인";
+                  // Excluding doesn't evict a device already using the IP —
+                  // only blocks it being offered again once free — so this
+                  // layers a dashed ring on top of whatever status color the
+                  // cell already has, rather than replacing it.
+                  if (cell.excluded) bgClass += " border-dashed !border-rose-500/70";
 
                   return (
                     <div
                       key={cell.ip}
                       className={`relative p-0.5 rounded border text-center font-mono text-[9px] select-none transition duration-150 ${bgClass}`}
-                      title={`IP: ${cell.ip}\n상태: ${titleStatus}\n장비명: ${cell.hostname}${hasLeaseLikeStatus ? `\n온라인 상태: ${onlineLabel}` : ''}`}
+                      title={`IP: ${cell.ip}\n상태: ${titleStatus}${cell.excluded ? ' (DHCP 할당 제외)' : ''}\n장비명: ${cell.hostname}${hasLeaseLikeStatus ? `\n온라인 상태: ${onlineLabel}` : ''}`}
                     >
+                      <input
+                        type="checkbox"
+                        checked={cell.excluded}
+                        onChange={() => onToggleExcludedIp(cell.ip)}
+                        onClick={(e) => e.stopPropagation()}
+                        title={cell.excluded ? "DHCP 할당 제외 해제" : "DHCP 할당에서 제외"}
+                        className="absolute top-[1px] left-[1px] w-2 h-2 cursor-pointer accent-rose-500"
+                      />
                       {hasLeaseLikeStatus && (
                         <span className={`absolute top-[1px] right-[1px] w-1 h-1 rounded-full ${onlineDotClass}`}></span>
                       )}
@@ -1365,7 +1390,7 @@ export default function DhcpServer({
                             <RefreshCw className="w-3 h-3" />
                           </button>
                         )}
-                        {lease.id !== 'host-pc-self' && (
+                        {lease.id !== 'host-pc-self' && lease.status !== 'reserved' && (
                           <button
                             id={`remove-lease-${lease.id}`}
                             onClick={() => onRemoveLease(lease.id)}
@@ -1490,7 +1515,7 @@ export default function DhcpServer({
                               <RefreshCw className="w-3.5 h-3.5" />
                             </button>
                           )}
-                          {lease.id !== 'host-pc-self' && (
+                          {lease.id !== 'host-pc-self' && lease.status !== 'reserved' && (
                             <button
                               id={`remove-lease-table-${lease.id}`}
                               onClick={() => onRemoveLease(lease.id)}

@@ -19,6 +19,13 @@ export interface DhcpConfig {
   // (there's only one bound adapter and one server identity), but each range
   // can override gateway/dns/leaseTime for clients landing in it.
   extraRanges?: DhcpRange[];
+  // Individual IPs to never hand out via DISCOVER/REQUEST, even though they
+  // fall inside rangeStart-rangeEnd or an extraRanges chunk — toggled from
+  // the checkbox on each cell in the "IP 사용 현황" map (see
+  // POST /api/dhcp/excluded-ips/toggle). Does not evict a device already
+  // using the IP, only prevents it being offered again once free — the same
+  // "exclusion range" behavior most DHCP servers use.
+  excludedIps?: string[];
 }
 
 export interface DhcpRange {
