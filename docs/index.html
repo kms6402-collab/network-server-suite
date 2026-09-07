@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>바코드 리더</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600;700&display=swap">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/quagga/0.12.1/quagga.min.js"></script>
+<style>
+  :root {
+    --bg: #F5F7FA;
+    --surface: #FFFFFF;
+    --surface-2: #EDF0F4;
+    --border: #D8DEE6;
+    --text: #1A1F26;
+    --text-muted: #5B6472;
+    --accent: #049775;
+    --accent-soft: #E3F5EF;
+    --accent-contrast: #FFFFFF;
+    --danger: #C4383B;
+    --danger-soft: #FBE9E8;
+    --laser: #FF3B3B;
+    --mono-bg: #12161C;
+    --mono-panel: #191F27;
+    --mono-text: #E8ECF1;
+    --mono-muted: #7C879A;
+    --font-display: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+    --font-mono: 'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0F1115;
+      --surface: #161A21;
+      --surface-2: #1D222B;
+      --border: #2A303B;
+      --text: #E8ECF1;
+      --text-muted: #8B93A1;
+      --accent: #1FE3B0;
+      --accent-soft: #123028;
+      --accent-contrast: #062019;
+      --danger: #FF6B6E;
+      --danger-soft: #3A1A1B;
+    }
+  }
+
+  :root[data-theme="dark"] {
+    --bg: #0F1115;
+    --surface: #161A21;
+    --surface-2: #1D222B;
+    --border: #2A303B;
+    --text: #E8ECF1;
+    --text-muted: #8B93A1;
+    --accent: #1FE3B0;
+    --accent-soft: #123028;
+    --accent-contrast: #062019;
+    --danger: #FF6B6E;
+    --danger-soft: #3A1A1B;
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-display);
+    display: flex;
+    justify-content: center;
+  }
+
+  .app {
+    width: 100%;
+    max-width: 480px;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 16px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .brand-mark {
+    width: 34px;
+    height: 34px;
+    border-radius: 9px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+  }
+
+  .brand h1 {
+    font-size: 16px;
+    font-weight: 700;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+
+  .brand p {
+    margin: 1px 0 0;
+    font-size: 12px;
+    color: var(--text-muted);
+  }
+
+  #db-badge {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--accent);
+    background: var(--accent-soft);
+    padding: 5px 10px;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+
+  main {
+    flex: 1;
+    padding: 16px 18px 28px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  /* ---- Camera / scan area ---- */
+
+  .scan-frame {
+    position: relative;
+    border-radius: 16px;
+    overflow: hidden;
+    background: var(--mono-bg);
+    aspect-ratio: 4 / 5;
+    box-shadow: 0 1px 0 rgba(0,0,0,0.04), 0 12px 28px -18px rgba(0,0,0,0.5);
+  }
+
+  #interactive {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  #interactive video, #interactive canvas {
+    position: absolute;
+    inset: 0;
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover;
+  }
+
+  .scan-frame::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    pointer-events: none;
+    background: linear-gradient(180deg, rgba(0,0,0,0.45) 0%, rgba(0,0,0,0) 22%, rgba(0,0,0,0) 78%, rgba(0,0,0,0.5) 100%);
+    opacity: 0;
+    transition: opacity .25s ease;
+  }
+
+  .scan-frame.is-live::before { opacity: 1; }
+
+  .placeholder {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    padding: 24px;
+    text-align: center;
+    color: var(--mono-muted);
+  }
+
+  .placeholder svg { color: var(--accent); opacity: 0.9; }
+  .placeholder p { margin: 0; font-size: 13px; line-height: 1.5; color: #C3CAD4; }
+  .placeholder.error { color: var(--danger); }
+  .placeholder.error p { color: #F0B9BA; }
+
+  .scan-frame.is-live .placeholder { display: none; }
+
+  .laser-track {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: none;
+    pointer-events: none;
+  }
+
+  .scan-frame.is-live .laser-track { display: block; }
+
+  .laser-line {
+    position: absolute;
+    left: 6%;
+    right: 6%;
+    top: 50%;
+    height: 2px;
+    transform: translateY(-1px);
+    background: var(--laser);
+    box-shadow: 0 0 8px 1px var(--laser), 0 0 22px 4px rgba(255,59,59,0.55);
+    animation: laser-pulse 1.6s ease-in-out infinite;
+  }
+
+  @keyframes laser-pulse {
+    0%, 100% { opacity: 0.55; }
+    50% { opacity: 1; }
+  }
+
+  .laser-frame {
+    position: absolute;
+    left: 6%;
+    right: 6%;
+    top: 50%;
+    height: 84px;
+    transform: translateY(-42px);
+    border-left: 2px solid rgba(255,59,59,0.9);
+    border-right: 2px solid rgba(255,59,59,0.9);
+  }
+
+  .readout-chip {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, calc(-50% - 32px));
+    max-width: 88%;
+    padding: 6px 12px;
+    border-radius: 8px;
+    background: rgba(18, 22, 28, 0.88);
+    border: 1px solid rgba(255,255,255,0.08);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--mono-muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color .15s ease, border-color .15s ease;
+  }
+
+  .readout-chip.has-value {
+    color: #fff;
+    border-color: rgba(31,227,176,0.5);
+  }
+
+  .readout-chip.flash {
+    animation: chip-flash .5s ease;
+  }
+
+  @keyframes chip-flash {
+    0% { background: rgba(31,227,176,0.35); }
+    100% { background: rgba(18, 22, 28, 0.88); }
+  }
+
+  /* ---- Controls ---- */
+
+  .toggle-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    padding: 13px 16px;
+    border: none;
+    border-radius: 12px;
+    font-family: inherit;
+    font-size: 14.5px;
+    font-weight: 600;
+    cursor: pointer;
+    background: var(--accent);
+    color: var(--accent-contrast);
+    transition: transform .08s ease, opacity .15s ease;
+  }
+
+  .toggle-btn:active { transform: scale(0.98); }
+  .toggle-btn.is-stop { background: var(--surface-2); color: var(--text); border: 1px solid var(--border); }
+
+  .manual-group {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .manual-row {
+    display: flex;
+    gap: 8px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 6px;
+  }
+
+  .manual-row input {
+    flex: 1;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    padding: 8px 10px;
+    font-family: var(--font-mono);
+    font-size: 13.5px;
+    color: var(--text);
+  }
+
+  .manual-row input:focus { outline: none; }
+  .manual-row input::placeholder { color: var(--text-muted); font-family: var(--font-display); }
+
+  .manual-row button {
+    flex: none;
+    border: none;
+    border-radius: 8px;
+    padding: 0 16px;
+    background: var(--surface-2);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .manual-suggestions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 220px;
+    overflow-y: auto;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 6px;
+  }
+
+  .manual-suggestions .sg-hint {
+    font-size: 11px;
+    color: var(--text-muted);
+    padding: 4px 6px 2px;
+  }
+
+  .suggestion-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    width: 100%;
+    border: none;
+    background: var(--surface-2);
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-family: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+
+  .suggestion-row:active { transform: scale(0.99); }
+
+  .suggestion-row .sg-key {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text);
+    flex: none;
+  }
+
+  .suggestion-row .sg-value {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+  }
+
+  /* ---- Readout panel (device screen look, stays dark in both themes) ---- */
+
+  .panel-label {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+
+  .readout-panel {
+    background: var(--mono-bg);
+    border-radius: 14px;
+    padding: 4px;
+  }
+
+  .readout-row {
+    padding: 14px 16px;
+  }
+
+  .readout-row + .readout-row {
+    border-top: 1px solid rgba(255,255,255,0.06);
+  }
+
+  .readout-row .rr-label {
+    font-size: 10.5px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--mono-muted);
+    margin: 0 0 4px;
+  }
+
+  .readout-row .rr-value {
+    font-family: var(--font-mono);
+    font-size: 19px;
+    font-weight: 600;
+    color: var(--mono-text);
+    font-variant-numeric: tabular-nums;
+    word-break: break-all;
+    margin: 0;
+  }
+
+  .readout-row .rr-value.is-empty {
+    font-family: var(--font-display);
+    font-size: 13.5px;
+    font-weight: 400;
+    color: var(--mono-muted);
+  }
+
+  .readout-row .rr-value.is-miss {
+    color: #FF9B9D;
+    font-size: 14.5px;
+    font-weight: 500;
+  }
+
+  .readout-row .rr-value.is-hit {
+    color: #6FF0C4;
+  }
+
+  .engine-note {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-align: center;
+    margin: -6px 0 0;
+  }
+
+  footer {
+    padding: 4px 18px 18px;
+    font-size: 11.5px;
+    color: var(--text-muted);
+    text-align: center;
+  }
+</style>
+</head>
+<body>
+
+<div class="app">
+  <header>
+    <div class="brand">
+      <span class="brand-mark">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"></rect><line x1="3" y1="12" x2="21" y2="12"></line><line x1="7" y1="8" x2="7" y2="8"></line><line x1="11" y1="8" x2="11" y2="8"></line></svg>
+      </span>
+      <div>
+        <h1>바코드 리더</h1>
+        <p>카메라 중앙 라인으로 즉시 판독</p>
+      </div>
+    </div>
+    <span id="db-badge">DB 137건</span>
+  </header>
+
+  <main>
+    <div class="scan-frame" id="scan-frame">
+      <div id="interactive"></div>
+
+      <div class="placeholder" id="placeholder">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path><circle cx="12" cy="13" r="4"></circle></svg>
+        <p>카메라를 시작하면<br>가운데 라인 위에 스캔 값이 표시됩니다</p>
+      </div>
+
+      <div class="laser-track">
+        <div class="laser-frame"></div>
+        <div class="readout-chip" id="readout-chip">스캔 대기 중…</div>
+        <div class="laser-line"></div>
+      </div>
+    </div>
+
+    <button class="toggle-btn" id="toggle-btn">
+      <svg id="toggle-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>
+      <span id="toggle-label">스캔 시작</span>
+    </button>
+
+    <p class="engine-note" id="engine-note"></p>
+
+    <div class="manual-group">
+      <div class="manual-row">
+        <input type="text" id="manual-input" placeholder="바코드 값 직접 입력 (예: N16-16, 51355)" autocomplete="off">
+        <button id="manual-btn">조회</button>
+      </div>
+      <div class="manual-suggestions" id="manual-suggestions" hidden></div>
+    </div>
+
+    <div>
+      <p class="panel-label">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>
+        판독 결과
+      </p>
+      <div class="readout-panel">
+        <div class="readout-row">
+          <p class="rr-label">바코드 스캔 값</p>
+          <p class="rr-value is-empty" id="res-barcode">아직 스캔된 값이 없습니다</p>
+        </div>
+        <div class="readout-row">
+          <p class="rr-label">매칭된 시리얼 (S/N)</p>
+          <p class="rr-value is-empty" id="res-serial">—</p>
+        </div>
+      </div>
+    </div>
+  </main>
+
+  <footer>카메라 전환 없이 후면 카메라 한 대로만 스캔합니다 · Barcode Reader</footer>
+</div>
+
+<script>
+  // 업로드된 바코드 → 시리얼(S/N) 매핑 데이터
+  const barcodeDatabase = {
+    "N16-16": "WM052534W-51422", "N16-17": "WM052534W-52383", "N16-18": "WM052534W-52365",
+    "N16-19": "WM052534W-51404", "N16-20": "WM052534W-52343", "N16-21": "WM052534W-52511",
+    "N20-39": "WM052534W-51695", "N20-40": "WM052534W-51400", "N20-41": "WM052534W-51242",
+    "N20-42": "WM052534W-51164", "N20-43": "WM052534W-52279", "N20-44": "WM052534W-51333",
+    "N21-45": "WM052534W-51103", "N21-46": "WM052534W-51290", "N21-47": "WM052534W-52203",
+    "N21-48": "WM052534W-51252", "N21-49": "WM052534W-52504", "N21-50": "WM052534W-52175",
+    "N22-51": "WM052534W-51261", "N22-52": "WM052534W-51395", "N22-53": "WM052533W-51615",
+    "N22-54": "WM052534W-52028", "N22-55": "WM052534W-51063", "N22-56": "WM052534W-52200",
+    "N23-57": "WM052534W-51859", "N23-58": "WM052533W-51915", "N23-59": "WM052534W-52145",
+    "N23-60": "WM052534W-50177", "N24-61": "WM052534W-51632", "N24-62": "WM052534W-52019",
+    "N24-63": "WM052534W-52208", "N24-64": "WM052534W-51169", "N24-65": "WM052534W-51357",
+    "N24-66": "WM052534W-51235", "N24-67": "WM052534W-51041", "N24-68": "WM052534W-51871",
+    "N24-69": "WM052534W-52239", "N26-78": "WM052534W-51362", "N26-79": "WM052534W-52049",
+    "N26-80": "WM052533W-51328", "N26-81": "WM052533W-51346", "N26-82": "WM052533W-51411",
+    "N26-83": "WM052533W-51397", "N26-84": "WM052533W-51384", "N27-85": "WM052533W-51385",
+    "N27-86": "WM052533W-51246", "N27-87": "WM052534W-51592", "N27-88": "WM052534W-51248",
+    "N27-89": "WM052534W-51205", "N27-90": "WM052534W-51296", "N27-91": "WM052534W-51543",
+    "N27-92": "WM052534W-51274", "S05-35": "WM052534W-51120", "S05-36": "WM052533W-51422",
+    "S05-37": "WM052534W-51209", "S05-38": "WM052534W-51168", "S05-39": "WM052534W-51170",
+    "S05-40": "WM052534W-51418", "S08-54": "WM052534W-51853", "S08-55": "WM052534W-51161",
+    "S08-56": "WM052534W-51027", "S08-57": "WM052534W-51439", "S08-58": "WM052534W-51355",
+    "S08-59": "WM052534W-51339", "S09-60": "WM052534W-51604", "S09-61": "WM052534W-51073",
+    "S09-62": "WM052534W-51236", "S09-63": "WM052534W-51047", "S09-64": "WM052534W-51249",
+    "S09-65": "WM052534W-51407", "S10-66": "WM052534W-51815", "S10-67": "WM052534W-51053",
+    "S10-68": "WM052534W-51547", "S10-69": "WM052534W-51150", "S10-70": "WM052534W-51477",
+    "S10-71": "WM052534W-51200", "S11-72": "WM052534W-51483", "S11-73": "WM052534W-51718",
+    "S11-74": "WM052534W-52039", "S11-75": "WM052534W-51675", "S11-76": "WM052534W-52324",
+    "S11-77": "WM052534W-52136", "S12-78": "WM052534W-52295", "S12-79": "WM052534W-52232",
+    "S12-80": "WM052534W-52575", "S12-81": "WM052534W-52227", "S12-82": "WM052534W-52351",
+    "S12-83": "WM052534W-51099", "S13-84": "WM052534W-52593", "S13-85": "WM052534W-52045",
+    "S13-86": "WM052534W-51353", "S13-87": "WM052534W-51097", "S13-88": "WM052534W-51677",
+    "S13-89": "WM052533W-51311", "S14-90": "WM052534W-52242", "S14-91": "WM052534W-52147",
+    "S14-92": "WM052534W-52336", "S14-93": "WM052534W-51226", "S14-94": "WM052534W-51204",
+    "S14-95": "WM052534W-51867", "S15-96": "WM052533W-51362", "S15-97": "WM052534W-52101",
+    "S15-98": "WM052534W-51752", "S15-99": "WM052534W-51234", "S15-100": "WM052534W-52529",
+    "S16-101": "WM052534W-51250", "S16-102": "WM052534W-51071", "S16-103": "WM052534W-51379",
+    "S16-104": "WM052534W-52277", "S16-105": "WM052534W-51481", "S16-106": "WM052534W-51472",
+    "S17-107": "WM052534W-51180", "S17-108": "WM052534W-51113", "S17-109": "WM052534W-50339",
+    "S17-110": "WM052533W-51255", "S17-111": "WM052534W-50979", "S18-112": "WM052534W-51337",
+    "S18-113": "WM052534W-51597", "S18-114": "WM052534W-51059", "S18-115": "WM052534W-51900",
+    "S18-116": "WM052534W-51961", "S18-117": "WM052534W-52221", "S19-118": "WM052534W-51484",
+    "S19-119": "WM052534W-51570", "S19-120": "WM052534W-52584", "S19-121": "WM052534W-51559",
+    "S19-122": "WM052533W-51382", "S19-123": "WM052534W-52211", "S20-124": "WM052533W-51371",
+    "S20-125": "WM052534W-51091", "S20-126": "WM052534W-51541", "S20-127": "WM052534W-51107",
+    "S20-128": "WM052534W-51210", "S20-129": "WM052534W-51505", "S21-130": "WM052534W-51125",
+    "S21-131": "WM052534W-51298", "S21-132": "WM052533W-51341", "S21-133": "WM052534W-51239",
+    "S21-134": "WM052534W-52466", "S21-135": "WM052534W-51130", "S22-136": "WM052534W-51376"
+  };
+
+  document.getElementById('db-badge').textContent = 'DB ' + Object.keys(barcodeDatabase).length + '건';
+
+  const scanFrame = document.getElementById('scan-frame');
+  const interactiveEl = document.getElementById('interactive');
+  const placeholder = document.getElementById('placeholder');
+  const readoutChip = document.getElementById('readout-chip');
+  const toggleBtn = document.getElementById('toggle-btn');
+  const toggleIcon = document.getElementById('toggle-icon');
+  const toggleLabel = document.getElementById('toggle-label');
+  const engineNote = document.getElementById('engine-note');
+  const resBarcode = document.getElementById('res-barcode');
+  const resSerial = document.getElementById('res-serial');
+
+  const ICON_PLAY = '<polygon points="6 3 20 12 6 21 6 3"></polygon>';
+  const ICON_STOP = '<rect x="5" y="5" width="14" height="14" rx="2"></rect>';
+
+  // Code 128은 문자+숫자+하이픈이 섞여도 정확히 읽히는 반면, QuaggaJS의
+  // code_128_reader는 이런 혼합 바코드에서 종종 앞/뒤 문자를 놓친다.
+  // 브라우저 네이티브 BarcodeDetector(Android Chrome)가 있으면 그걸 우선 쓰고,
+  // 지원하지 않는 브라우저(iOS Safari 등)에서만 QuaggaJS로 폴백한다.
+  const hasNativeDetector = 'BarcodeDetector' in window;
+  let engine = null; // 'native' | 'quagga'
+  let isScanning = false;
+  let flashTimer = null;
+  let nativeStream = null;
+  let nativeVideoEl = null;
+  let nativeLoopId = null;
+  let lastNativeCode = '';
+  let lastNativeAt = 0;
+
+  function setResult(code) {
+    const trimmed = code.trim();
+    if (!trimmed) return;
+
+    // 카메라로 스캔한 값은 등록된 짧은 태그(키)일 수도, 그 태그가 가리키는
+    // 시리얼(값)이 직접 인쇄된 경우일 수도 있어 양쪽 다 정확히 일치하는지 확인한다.
+    if (barcodeDatabase[trimmed]) {
+      applyMatch(trimmed, barcodeDatabase[trimmed]);
+      return;
+    }
+    const exactValueKey = Object.keys(barcodeDatabase).find((k) => barcodeDatabase[k] === trimmed);
+    if (exactValueKey) {
+      applyMatch(exactValueKey, barcodeDatabase[exactValueKey]);
+      return;
+    }
+
+    resBarcode.textContent = trimmed;
+    resBarcode.className = 'rr-value';
+    resSerial.textContent = '등록되지 않은 바코드입니다';
+    resSerial.className = 'rr-value is-miss';
+
+    readoutChip.textContent = trimmed;
+    readoutChip.classList.add('has-value', 'flash');
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => readoutChip.classList.remove('flash'), 500);
+  }
+
+  function applyMatch(key, value) {
+    resBarcode.textContent = key;
+    resBarcode.className = 'rr-value';
+    resSerial.textContent = value;
+    resSerial.className = 'rr-value is-hit';
+
+    readoutChip.textContent = key;
+    readoutChip.classList.add('has-value', 'flash');
+    clearTimeout(flashTimer);
+    flashTimer = setTimeout(() => readoutChip.classList.remove('flash'), 500);
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, (c) => ({
+      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+    }[c]));
+  }
+
+  // 대소문자 구분 없이, 태그(키)와 시리얼(값) 양쪽 모두에서 부분 문자열을 찾는다.
+  function searchDatabase(query) {
+    const q = query.trim().toLowerCase();
+    if (!q) return [];
+    return Object.entries(barcodeDatabase).filter(
+      ([key, value]) => key.toLowerCase().includes(q) || value.toLowerCase().includes(q)
+    );
+  }
+
+  function hideSuggestions() {
+    manualSuggestions.hidden = true;
+    manualSuggestions.innerHTML = '';
+  }
+
+  function renderSuggestions(matches, query) {
+    if (!matches.length) {
+      hideSuggestions();
+      return;
+    }
+    const shown = matches.slice(0, 8);
+    const hint = matches.length > shown.length
+      ? `"${escapeHtml(query)}" 일치 ${matches.length}건 중 ${shown.length}건 표시`
+      : `"${escapeHtml(query)}" 일치 ${matches.length}건 - 선택하세요`;
+
+    manualSuggestions.innerHTML = '<div class="sg-hint">' + hint + '</div>' + shown.map(([key, value]) => (
+      '<button type="button" class="suggestion-row" data-key="' + escapeHtml(key) + '">' +
+        '<span class="sg-key">' + escapeHtml(key) + '</span>' +
+        '<span class="sg-value">' + escapeHtml(value) + '</span>' +
+      '</button>'
+    )).join('');
+    manualSuggestions.hidden = false;
+
+    manualSuggestions.querySelectorAll('.suggestion-row').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const key = btn.getAttribute('data-key');
+        manualInput.value = key;
+        applyMatch(key, barcodeDatabase[key]);
+        hideSuggestions();
+      });
+    });
+  }
+
+  function showPlaceholder(message, isError) {
+    placeholder.querySelector('p').innerHTML = message;
+    placeholder.classList.toggle('error', !!isError);
+    scanFrame.classList.remove('is-live');
+  }
+
+  function describeCameraError(err) {
+    const name = err && err.name;
+    if (!window.isSecureContext) {
+      return 'HTTPS(또는 localhost) 연결이 아니라서 카메라를 사용할 수 없습니다.<br>주소가 https:// 로 시작하는지 확인해주세요.';
+    }
+    if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+      return '카메라 접근 권한이 거부되었습니다.<br>브라우저 설정에서 이 사이트의 카메라 권한을 허용한 뒤 새로고침 해주세요.';
+    }
+    if (name === 'NotFoundError' || name === 'OverconstrainedError') {
+      return '이 기기에서 사용 가능한 카메라를 찾을 수 없습니다.';
+    }
+    if (name === 'NotReadableError' || name === 'TrackStartError') {
+      return '다른 앱이 카메라를 사용 중입니다.<br>카메라를 쓰는 다른 앱을 종료한 뒤 다시 시도해주세요.';
+    }
+    return '카메라를 시작할 수 없습니다.<br>브라우저의 카메라 권한을 확인해주세요.';
+  }
+
+  function handleManualSearch() {
+    const trimmed = manualInput.value.trim();
+    if (!trimmed) return;
+
+    // 1) 태그(키) 또는 시리얼(값)과 정확히 일치하면 바로 확정
+    if (barcodeDatabase[trimmed]) {
+      applyMatch(trimmed, barcodeDatabase[trimmed]);
+      hideSuggestions();
+      return;
+    }
+    const exactValueKey = Object.keys(barcodeDatabase).find((k) => barcodeDatabase[k] === trimmed);
+    if (exactValueKey) {
+      applyMatch(exactValueKey, barcodeDatabase[exactValueKey]);
+      hideSuggestions();
+      return;
+    }
+
+    // 2) 완전히 일치하는 값이 없으면 부분 문자열로 유사/동일 항목을 찾는다
+    const matches = searchDatabase(trimmed);
+    if (matches.length === 1) {
+      applyMatch(matches[0][0], matches[0][1]);
+      hideSuggestions();
+    } else if (matches.length > 1) {
+      renderSuggestions(matches, trimmed);
+    } else {
+      hideSuggestions();
+      resBarcode.textContent = trimmed;
+      resBarcode.className = 'rr-value';
+      resSerial.textContent = '일치하는 바코드가 없습니다';
+      resSerial.className = 'rr-value is-miss';
+    }
+  }
+
+  const manualInput = document.getElementById('manual-input');
+  const manualSuggestions = document.getElementById('manual-suggestions');
+
+  document.getElementById('manual-btn').addEventListener('click', handleManualSearch);
+  manualInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') handleManualSearch();
+  });
+
+  // 입력하는 동안에도 두 글자 이상이면 실시간으로 후보를 보여준다
+  manualInput.addEventListener('input', () => {
+    const q = manualInput.value.trim();
+    if (q.length < 2 || barcodeDatabase[q]) {
+      hideSuggestions();
+      return;
+    }
+    renderSuggestions(searchDatabase(q), q);
+  });
+
+  function onBarcodeDetected(code) {
+    if (!code) return;
+    setResult(code);
+    if (navigator.vibrate) navigator.vibrate(120);
+  }
+
+  function markLive() {
+    isScanning = true;
+    scanFrame.classList.add('is-live');
+    toggleBtn.classList.add('is-stop');
+    toggleIcon.innerHTML = ICON_STOP;
+    toggleLabel.textContent = '스캔 중지';
+    readoutChip.textContent = '스캔 대기 중…';
+    readoutChip.classList.remove('has-value');
+  }
+
+  function resetToggle() {
+    isScanning = false;
+    toggleBtn.classList.remove('is-stop');
+    toggleIcon.innerHTML = ICON_PLAY;
+    toggleLabel.textContent = '스캔 시작';
+  }
+
+  // ---- Engine A: native BarcodeDetector (정확도 우선) ----
+
+  async function startNativeScanner() {
+    try {
+      nativeStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: 1280 },
+          height: { ideal: 960 }
+        },
+        audio: false
+      });
+    } catch (err) {
+      console.error(err);
+      showPlaceholder(describeCameraError(err), true);
+      resetToggle();
+      return;
+    }
+
+    nativeVideoEl = document.createElement('video');
+    nativeVideoEl.setAttribute('playsinline', '');
+    nativeVideoEl.setAttribute('muted', '');
+    nativeVideoEl.muted = true;
+    nativeVideoEl.autoplay = true;
+    nativeVideoEl.srcObject = nativeStream;
+    interactiveEl.innerHTML = '';
+    interactiveEl.appendChild(nativeVideoEl);
+
+    try {
+      await nativeVideoEl.play();
+    } catch (err) {
+      // Safari 등에서 autoplay가 막히면 첫 터치 이후 자동 재생됨 - 치명적이지 않음
+    }
+
+    let detector;
+    try {
+      detector = new BarcodeDetector({
+        formats: ['code_128', 'ean_13', 'ean_8', 'code_39', 'upc_a', 'upc_e']
+      });
+    } catch (err) {
+      // 이 브라우저는 요청한 포맷을 지원하지 않음 - Quagga로 폴백
+      stopNativeInternals();
+      startQuaggaScanner();
+      return;
+    }
+
+    engine = 'native';
+    markLive();
+    engineNote.textContent = '';
+
+    const loop = () => {
+      if (engine !== 'native' || !isScanning) return;
+      if (nativeVideoEl.readyState >= 2) {
+        detector.detect(nativeVideoEl).then((codes) => {
+          if (codes && codes.length > 0) {
+            const value = codes[0].rawValue;
+            const now = Date.now();
+            if (value !== lastNativeCode || now - lastNativeAt > 1200) {
+              lastNativeCode = value;
+              lastNativeAt = now;
+              onBarcodeDetected(value);
+            }
+          }
+        }).catch(() => {});
+      }
+      nativeLoopId = requestAnimationFrame(loop);
+    };
+    nativeLoopId = requestAnimationFrame(loop);
+  }
+
+  function stopNativeInternals() {
+    if (nativeLoopId) cancelAnimationFrame(nativeLoopId);
+    nativeLoopId = null;
+    if (nativeStream) {
+      nativeStream.getTracks().forEach((t) => t.stop());
+      nativeStream = null;
+    }
+    nativeVideoEl = null;
+    interactiveEl.innerHTML = '';
+    lastNativeCode = '';
+  }
+
+  function stopNativeScanner() {
+    stopNativeInternals();
+    resetToggle();
+    showPlaceholder('카메라를 시작하면<br>가운데 라인 위에 스캔 값이 표시됩니다', false);
+  }
+
+  // ---- Engine B: QuaggaJS (BarcodeDetector 미지원 브라우저용 폴백) ----
+
+  function onQuaggaDetected(result) {
+    const code = result && result.codeResult && result.codeResult.code;
+    if (code) onBarcodeDetected(code);
+  }
+
+  function startQuaggaScanner() {
+    engineNote.textContent = '호환 모드로 스캔 중 (일부 구형 브라우저)';
+    Quagga.init({
+      inputStream: {
+        name: 'Live',
+        type: 'LiveStream',
+        target: interactiveEl,
+        constraints: {
+          width: { ideal: 1280 },
+          height: { ideal: 960 },
+          facingMode: { ideal: 'environment' }
+        }
+      },
+      decoder: {
+        readers: ['code_128_reader', 'ean_reader', 'ean_8_reader', 'code_39_reader']
+      },
+      locate: true
+    }, function (err) {
+      if (err) {
+        console.error(err);
+        showPlaceholder(describeCameraError(err), true);
+        resetToggle();
+        return;
+      }
+      engine = 'quagga';
+      Quagga.start();
+      markLive();
+    });
+
+    Quagga.onDetected(onQuaggaDetected);
+  }
+
+  function stopQuaggaScanner() {
+    Quagga.offDetected(onQuaggaDetected);
+    Quagga.stop();
+    resetToggle();
+    showPlaceholder('카메라를 시작하면<br>가운데 라인 위에 스캔 값이 표시됩니다', false);
+    engineNote.textContent = '';
+  }
+
+  function startScanner() {
+    if (isScanning) return;
+    if (hasNativeDetector) startNativeScanner();
+    else startQuaggaScanner();
+  }
+
+  function stopScanner() {
+    if (!isScanning) return;
+    if (engine === 'native') stopNativeScanner();
+    else stopQuaggaScanner();
+    engine = null;
+  }
+
+  toggleBtn.addEventListener('click', () => {
+    if (isScanning) stopScanner();
+    else startScanner();
+  });
+</script>
+</body>
+</html>
