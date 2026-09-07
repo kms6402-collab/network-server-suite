@@ -3008,6 +3008,23 @@ app.delete("/api/hosts/:id", (req, res) => {
   res.json({ success: true, terminalHosts });
 });
 
+// On-demand single ping for a registered terminal host — the "ping test"
+// button in the device list. One-shot, not persisted (TerminalHost has no
+// online field, unlike DhcpLease which the periodic sweep keeps updated).
+app.post("/api/hosts/:id/ping", (req, res) => {
+  const host = terminalHosts.find(h => h.id === req.params.id);
+  if (!host) {
+    return res.status(404).json({ error: "장비를 찾을 수 없습니다." });
+  }
+  if (!isValidIPv4(host.ip)) {
+    return res.json({ success: true, online: false });
+  }
+  execFile("ping", ["-n", "1", "-w", "800", host.ip], (error, stdout) => {
+    const online = !error && /TTL=/i.test(stdout || "");
+    res.json({ success: true, online });
+  });
+});
+
 // Update an existing device profile. Reuses the same field validation as the
 // create route. Password is optional here: an empty/omitted password leaves
 // the previously stored password untouched (edit forms don't re-display the

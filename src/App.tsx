@@ -644,6 +644,22 @@ export default function App() {
     }
   };
 
+  // On-demand ping for a single registered host (the "ping test" button in
+  // the device list) — one-shot, not persisted anywhere.
+  const handlePingHost = async (id: string): Promise<boolean | null> => {
+    try {
+      const res = await fetch(`/api/hosts/${id}/ping`, { method: 'POST' });
+      if (res.ok) {
+        const data = await res.json();
+        return !!data.online;
+      }
+      return null;
+    } catch (e) {
+      console.error(e);
+      return null;
+    }
+  };
+
   const handleBulkImportHosts = async (devices: { name: string; ip: string }[], protocol: 'SSH' | 'TELNET', port: number, username: string, password?: string) => {
     try {
       const res = await fetch('/api/hosts/bulk-import', {
@@ -969,7 +985,7 @@ export default function App() {
             <h1 className="text-lg font-display font-bold tracking-tight text-white flex items-center gap-2">
               Network Server Suite
               <span className="text-[10px] font-sans font-semibold bg-indigo-500/10 text-indigo-300 px-2.5 py-0.5 border border-indigo-500/20 rounded-full tracking-wide">
-                v2.15.0 Enterprise
+                v2.16.0 Enterprise
               </span>
             </h1>
             <p className="text-xs text-slate-400 mt-1">DHCP·TFTP·FTP 관리 및 SSH/Telnet 자동화 콘솔</p>
@@ -1120,6 +1136,7 @@ export default function App() {
                 onAddHost={handleAddHost}
                 onUpdateHost={handleUpdateHost}
                 onRemoveHost={handleRemoveHost}
+                onPingHost={handlePingHost}
                 onBulkImportHosts={handleBulkImportHosts}
                 onBulkUpdateHosts={handleBulkUpdateHosts}
                 onBulkDeleteHosts={handleBulkDeleteHosts}

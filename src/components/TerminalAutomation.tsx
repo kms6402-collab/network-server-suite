@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import {
-  Terminal, ShieldCheck, Plus, Trash2, Play, Pencil,
+  Terminal, ShieldCheck, Plus, Trash2, Play, Pencil, Check,
   Send, Server, AlertCircle, RefreshCw, Download, Plug, Unplug, Radio,
   Wifi, CheckSquare, Square, PencilLine, X, XCircle, Save, Bookmark, Search
 } from 'lucide-react';
@@ -33,6 +33,7 @@ interface TerminalAutomationProps {
   onCloseSession: (execId: string) => void;
   onCloseAllSessions: () => void;
   onPollExecutions: () => void;
+  onPingHost: (hostId: string) => Promise<boolean | null>;
 }
 
 export default function TerminalAutomation({
@@ -61,7 +62,8 @@ export default function TerminalAutomation({
   onDisconnectSession,
   onCloseSession,
   onCloseAllSessions,
-  onPollExecutions
+  onPollExecutions,
+  onPingHost
 }: TerminalAutomationProps) {
 
   // Host Form State
@@ -82,6 +84,13 @@ export default function TerminalAutomation({
 
   // Multi-select state for bulk update/delete on the device list.
   const [selectedHostIds, setSelectedHostIds] = useState<Set<string>>(new Set());
+  // Filters the device list by hostname/IP substring (case-insensitive) —
+  // same pattern as leaseFilterText below for the DHCP-import checklist.
+  const [hostFilterText, setHostFilterText] = useState("");
+  // Transient per-host ping result (id -> online), cleared a few seconds
+  // after each ping so the row's dot flashes the result then settles back.
+  const [pingResults, setPingResults] = useState<Record<string, boolean>>({});
+  const [pingingHostId, setPingingHostId] = useState<string | null>(null);
 
   // DHCP import panel state
   const [showDhcpImportPanel, setShowDhcpImportPanel] = useState(false);
@@ -131,6 +140,15 @@ export default function TerminalAutomation({
   const [showScriptForm, setShowScriptForm] = useState(false);
   // Non-null while editing an existing script instead of creating a new one.
   const [editingScriptId, setEditingScriptId] = useState<string | null>(null);
+  // Filters the script list by name/description substring (case-insensitive).
+  const [scriptFilterText, setScriptFilterText] = useState("");
+  const filteredScripts = (() => {
+    const q = scriptFilterText.trim().toLowerCase();
+    if (!q) return scripts;
+    return scripts.filter(s =>
+      s.name.toLowerCase().includes(q) || (s.description || '').toLowerCase().includes(q)
+    );
+  })();
 
   // Execution selection state
   const [selectedHostId, setSelectedHostId] = useState(hosts[0]?.id || "");
@@ -340,11 +358,40 @@ export default function TerminalAutomation({
     });
   };
 
+  // Acts only on whatever the filter currently leaves visible, same reasoning
+  // as toggleSelectAllFilteredLeases below for the DHCP-import checklist.
   const toggleSelectAllHosts = () => {
     setSelectedHostIds(prev => {
-      if (prev.size === hosts.length) return new Set();
-      return new Set(hosts.map(h => h.id));
+      const next = new Set(prev);
+      const allFilteredSelected = filteredHosts.length > 0 && filteredHosts.every(h => next.has(h.id));
+      if (allFilteredSelected) {
+        filteredHosts.forEach(h => next.delete(h.id));
+      } else {
+        filteredHosts.forEach(h => next.add(h.id));
+      }
+      return next;
     });
+  };
+
+  // On-demand ping for a single registered host (independent of the DHCP
+  // lease-based online dot, which only updates while DHCP is running and
+  // only for devices that actually hold a lease). Result flashes on the
+  // row for a few seconds via pingResults, then clears back to the
+  // lease-derived dot.
+  const handlePingClick = async (hostId: string) => {
+    setPingingHostId(hostId);
+    const online = await onPingHost(hostId);
+    setPingingHostId(null);
+    if (online !== null) {
+      setPingResults(prev => ({ ...prev, [hostId]: online }));
+      setTimeout(() => {
+        setPingResults(prev => {
+          const next = { ...prev };
+          delete next[hostId];
+          return next;
+        });
+      }, 4000);
+    }
   };
 
   const resetDhcpImportPanel = () => {
@@ -502,12 +549,34 @@ export default function TerminalAutomation({
     return 0;
   };
   const sortedHosts = [...hosts].sort(compareHostsByIp);
+  const filteredHosts = (() => {
+    const q = hostFilterText.trim().toLowerCase();
+    if (!q) return sortedHosts;
+    return sortedHosts.filter(h =>
+      h.name.toLowerCase().includes(q) || h.ip.toLowerCase().includes(q)
+    );
+  })();
+
+  // Live online/offline status for a registered host, sourced from the DHCP
+  // lease matching its IP (leases.online is kept fresh by the backend's
+  // periodic ping sweep while DHCP is running) — undefined when no lease
+  // matches or that lease hasn't been checked yet.
+  const getHostOnline = (host: TerminalHost): boolean | undefined =>
+    leases.find(l => l.ip === host.ip)?.online;
 
   // The only way activeTabId changes as a direct result of the user clicking
   // a tab — see the auto-follow effect above for why this matters.
   const handleSelectTab = (id: string) => {
     userPinnedTabRef.current = true;
     setActiveTabId(id);
+  };
+
+  // Closes every successfully-completed session tab in one click, leaving
+  // 'running' and 'failed' ones alone so problem sessions stay visible for
+  // review. Just replays the existing per-session close (real DELETE call
+  // each) — no new backend route needed.
+  const handleCloseCompletedSessions = () => {
+    executions.filter(e => e.status === 'completed').forEach(e => onCloseSession(e.id));
   };
 
   const handleRunScript = async () => {
@@ -614,7 +683,7 @@ export default function TerminalAutomation({
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
         {/* Device Accounts Manager */}
-        <div className="p-5 glass-card rounded-2xl space-y-3 flex flex-col min-h-[400px] lg:h-auto">
+        <div className="p-5 glass-card rounded-2xl space-y-3 flex flex-col h-[400px]">
           <div className="flex items-center justify-between border-b border-slate-855 pb-2.5">
             <h3 className="text-sm font-display font-bold text-white flex items-center gap-1.5">
               <Server className="w-4 h-4 text-emerald-400" />
@@ -1032,16 +1101,38 @@ export default function TerminalAutomation({
                 </p>
               )}
               {hosts.length > 0 && (
+                <div className="relative shrink-0">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    id="host-filter-input"
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg py-1.5 pl-8 pr-7 text-white text-[11px] focus:outline-none focus:border-indigo-500"
+                    placeholder="호스트명 / IP로 필터"
+                    value={hostFilterText}
+                    onChange={(e) => setHostFilterText(e.target.value)}
+                  />
+                  {hostFilterText && (
+                    <button
+                      type="button"
+                      onClick={() => setHostFilterText("")}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+              {hosts.length > 0 && (
                 <div className="flex items-center justify-between gap-2 text-[10px] shrink-0">
                   <label className="flex items-center gap-1.5 text-slate-400 font-bold cursor-pointer select-none">
                     <input
                       type="checkbox"
                       id="select-all-hosts-checkbox"
                       className="accent-indigo-500 cursor-pointer"
-                      checked={hosts.length > 0 && selectedHostIds.size === hosts.length}
+                      checked={filteredHosts.length > 0 && filteredHosts.every(h => selectedHostIds.has(h.id))}
                       onChange={toggleSelectAllHosts}
                     />
-                    전체 선택 {selectedHostIds.size > 0 ? `(${selectedHostIds.size}개)` : ''}
+                    전체 선택{hostFilterText ? ` (필터된 ${filteredHosts.length}개)` : ''} {selectedHostIds.size > 0 ? `(${selectedHostIds.size}개 선택됨)` : ''}
                   </label>
                   <div className="flex items-center gap-1.5">
                     <button
@@ -1072,7 +1163,12 @@ export default function TerminalAutomation({
                 </div>
               )}
               <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-              {sortedHosts.map((host) => (
+              {filteredHosts.map((host) => {
+                const pingResult = pingResults[host.id];
+                const online = pingResult !== undefined ? pingResult : getHostOnline(host);
+                const onlineDotClass = online === undefined ? 'bg-slate-500' : online ? 'bg-emerald-400 animate-pulse' : 'bg-rose-500';
+                const onlineTitle = online === undefined ? '온라인 상태 알 수 없음' : online ? '온라인' : '오프라인';
+                return (
                 <div key={host.id} className={`p-3 bg-slate-950/40 border rounded-xl flex items-center justify-between hover:border-slate-700/80 hover:bg-slate-950/60 transition ${selectedHostIds.has(host.id) ? 'border-indigo-700/70 bg-indigo-950/10' : 'border-slate-850'}`}>
                   <div className="flex items-center gap-2.5 min-w-0">
                     <input
@@ -1082,6 +1178,7 @@ export default function TerminalAutomation({
                       checked={selectedHostIds.has(host.id)}
                       onChange={() => toggleHostSelected(host.id)}
                     />
+                    <span className={`w-1.5 h-1.5 rounded-full shrink-0 ${onlineDotClass}`} title={onlineTitle}></span>
                     <div className="space-y-1 min-w-0">
                       <div className="font-bold text-white text-xs truncate">{host.name}</div>
                       <div className="flex items-center gap-1.5 text-[10px] font-mono text-slate-400">
@@ -1112,6 +1209,16 @@ export default function TerminalAutomation({
                       <Pencil className="w-3.5 h-3.5" />
                     </button>
                     <button
+                      id={`ping-host-${host.id}`}
+                      type="button"
+                      onClick={() => handlePingClick(host.id)}
+                      disabled={pingingHostId === host.id}
+                      className="p-1.5 text-slate-400 hover:text-emerald-400 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg hover:bg-emerald-950/20 cursor-pointer transition"
+                      title="Ping 테스트"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${pingingHostId === host.id ? 'animate-spin' : ''}`} />
+                    </button>
+                    <button
                       id={`delete-host-${host.id}`}
                       onClick={() => onRemoveHost(host.id)}
                       className="p-1.5 text-slate-400 hover:text-rose-400 rounded-lg hover:bg-rose-950/20 cursor-pointer transition"
@@ -1121,9 +1228,13 @@ export default function TerminalAutomation({
                     </button>
                   </div>
                 </div>
-              ))}
+                );
+              })}
               {hosts.length === 0 && (
                 <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 장비가 없습니다.</div>
+              )}
+              {hosts.length > 0 && filteredHosts.length === 0 && (
+                <div className="text-slate-500 text-center py-16 text-xs font-medium">필터와 일치하는 장비가 없습니다.</div>
               )}
               </div>
             </div>
@@ -1208,8 +1319,31 @@ export default function TerminalAutomation({
               </div>
             </form>
           ) : (
-            <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
-              {scripts.map((script) => (
+            <div className="flex-1 flex flex-col min-h-0 space-y-2">
+              {scripts.length > 0 && (
+                <div className="relative shrink-0">
+                  <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                  <input
+                    type="text"
+                    id="script-filter-input"
+                    className="w-full bg-slate-900 border border-slate-800 rounded-lg py-1.5 pl-8 pr-7 text-white text-[11px] focus:outline-none focus:border-indigo-500"
+                    placeholder="스크립트명 / 설명으로 필터"
+                    value={scriptFilterText}
+                    onChange={(e) => setScriptFilterText(e.target.value)}
+                  />
+                  {scriptFilterText && (
+                    <button
+                      type="button"
+                      onClick={() => setScriptFilterText("")}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-500 hover:text-white cursor-pointer"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  )}
+                </div>
+              )}
+              <div className="flex-1 overflow-y-auto space-y-2.5 pr-1">
+              {filteredScripts.map((script) => (
                 <div key={script.id} className="p-3 bg-slate-950/40 border border-slate-850 rounded-xl flex items-center justify-between hover:border-slate-700/80 hover:bg-slate-950/60 transition">
                   <div className="space-y-1">
                     <div className="font-bold text-white text-xs">{script.name}</div>
@@ -1239,6 +1373,10 @@ export default function TerminalAutomation({
               {scripts.length === 0 && (
                 <div className="text-slate-500 text-center py-16 text-xs font-medium">등록된 스크립트가 없습니다.</div>
               )}
+              {scripts.length > 0 && filteredScripts.length === 0 && (
+                <div className="text-slate-500 text-center py-16 text-xs font-medium">필터와 일치하는 스크립트가 없습니다.</div>
+              )}
+              </div>
             </div>
           )}
         </div>
@@ -1423,61 +1561,69 @@ export default function TerminalAutomation({
 
       {/* Interactive Concurrent Terminal Sessions */}
       <div className="p-5 glass-card rounded-2xl space-y-4">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-slate-855 pb-3">
-          <div className="shrink-0 max-w-full sm:max-w-[45%]">
+        <div className="space-y-2.5 border-b border-slate-855 pb-3">
+          <div className="flex items-center gap-2">
             <h3 className="text-sm font-display font-bold text-white">
               실시간 세션 뷰어
             </h3>
-            <p className="text-[11px] text-slate-400 mt-0.5">장비별 세션 상태와 로그</p>
-          </div>
-
-          {/* Active session tabs selection */}
-          <div className="flex items-center gap-1.5 min-w-0 flex-1">
-            <div className="flex gap-1.5 overflow-x-auto max-w-full pb-1">
-              {executions.map((exec, idx) => (
-                <div
-                  id={`tab-${exec.id}`}
-                  key={exec.id}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold shrink-0 flex items-center gap-1.5 border transition ${
-                    activeTabId === exec.id
-                      ? 'bg-slate-950 text-emerald-400 border-slate-700/80'
-                      : 'bg-slate-900/50 text-slate-400 border-slate-850 hover:border-slate-700'
-                  }`}
-                >
-                  <button
-                    type="button"
-                    onClick={() => handleSelectTab(exec.id)}
-                    className="flex items-center gap-1.5 cursor-pointer"
-                  >
-                    <Terminal className="w-3.5 h-3.5" />
-                    Session-{idx + 1}
-                    <span className={`w-1.5 h-1.5 rounded-full ${exec.status === 'running' ? 'bg-amber-400 animate-ping' : exec.status === 'completed' ? 'bg-emerald-400' : 'bg-rose-500'}`}></span>
-                  </button>
-                  <button
-                    type="button"
-                    id={`close-tab-${exec.id}`}
-                    onClick={() => onCloseSession(exec.id)}
-                    className="ml-0.5 p-0.5 rounded hover:bg-rose-950/60 hover:text-rose-400 text-slate-500 cursor-pointer transition"
-                    title="세션 닫기 (탭 제거)"
-                  >
-                    <X className="w-3 h-3" />
-                  </button>
-                </div>
-              ))}
-              {executions.length === 0 && (
-                <span className="text-[11px] text-slate-500 py-1.5 font-medium">활성 자동화 세션 없음</span>
-              )}
-            </div>
+            {executions.some(e => e.status === 'completed') && (
+              <button
+                id="close-completed-sessions-btn"
+                onClick={handleCloseCompletedSessions}
+                className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 border border-slate-850 text-slate-400 hover:text-emerald-400 hover:border-emerald-900/60 hover:bg-emerald-950/20 cursor-pointer transition"
+                title="정상적으로 완료된 세션만 일괄 종료"
+              >
+                <Check className="w-3.5 h-3.5" />
+                정상 세션 종료
+              </button>
+            )}
             {executions.length > 1 && (
               <button
                 id="close-all-sessions-btn"
                 onClick={onCloseAllSessions}
-                className="shrink-0 px-2.5 py-1.5 rounded-lg text-[11px] font-bold flex items-center gap-1 border border-slate-850 text-slate-400 hover:text-rose-400 hover:border-rose-900/60 hover:bg-rose-950/20 cursor-pointer transition"
+                className="shrink-0 px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 border border-slate-850 text-slate-400 hover:text-rose-400 hover:border-rose-900/60 hover:bg-rose-950/20 cursor-pointer transition"
                 title="모든 세션 닫기"
               >
                 <XCircle className="w-3.5 h-3.5" />
                 모두 닫기
               </button>
+            )}
+          </div>
+
+          {/* Active session tabs selection */}
+          <div className="flex gap-1.5 overflow-x-auto max-w-full pb-1">
+            {executions.map((exec, idx) => (
+              <div
+                id={`tab-${exec.id}`}
+                key={exec.id}
+                className={`px-3 py-1.5 rounded-lg text-xs font-mono font-bold shrink-0 flex items-center gap-1.5 border transition ${
+                  activeTabId === exec.id
+                    ? 'bg-slate-950 text-emerald-400 border-slate-700/80'
+                    : 'bg-slate-900/50 text-slate-400 border-slate-850 hover:border-slate-700'
+                }`}
+              >
+                <button
+                  type="button"
+                  onClick={() => handleSelectTab(exec.id)}
+                  className="flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Terminal className="w-3.5 h-3.5" />
+                  Session-{idx + 1}
+                  <span className={`w-1.5 h-1.5 rounded-full ${exec.status === 'running' ? 'bg-amber-400 animate-ping' : exec.status === 'completed' ? 'bg-emerald-400' : 'bg-rose-500'}`}></span>
+                </button>
+                <button
+                  type="button"
+                  id={`close-tab-${exec.id}`}
+                  onClick={() => onCloseSession(exec.id)}
+                  className="ml-0.5 p-0.5 rounded hover:bg-rose-950/60 hover:text-rose-400 text-slate-500 cursor-pointer transition"
+                  title="세션 닫기 (탭 제거)"
+                >
+                  <X className="w-3 h-3" />
+                </button>
+              </div>
+            ))}
+            {executions.length === 0 && (
+              <span className="text-[11px] text-slate-500 py-1.5 font-medium">활성 자동화 세션 없음</span>
             )}
           </div>
         </div>

@@ -134,90 +134,41 @@ export default function DhcpServer({
   const intToIp = (n: number): string =>
     [Math.floor(n / 16777216) % 256, Math.floor(n / 65536) % 256, Math.floor(n / 256) % 256, n % 256].join(".");
 
-  const getIpStatusMap = () => {
+  interface IpStatusCell {
+    ip: string;
+    ipInt: number;
+    label: string;
+    status: 'leased' | 'reserved' | 'self' | 'available';
+    hostname: string;
+    online?: boolean;
+    excluded: boolean;
+  }
+  interface IpStatusGroup {
+    key: string;
+    label: string;
+    cells: IpStatusCell[];
+  }
+
+  // Renders the primary range and each extra range as its own visually
+  // separated section (so a gapped pool like 1~30 / 50~100 / 101~106 reads
+  // as three distinct blocks instead of one continuous flowing grid), with
+  // every cell sorted into ascending IP order within its section. A device
+  // leased/reserved at an IP outside every configured range (e.g. the DHCP
+  // server's own "내 PC" IP, or an ARP-discovered static-IP device) is
+  // merged into whichever section shares its /24-ish block — e.g. the
+  // server IP .4 sorts in ahead of a .100~.200 pool in the same block — and
+  // only lands in a final "기타" section when no section shares its block.
+  const getIpStatusMap = (): IpStatusGroup[] => {
     try {
-      // Was single-range only, and assumed rangeStart/rangeEnd shared the
-      // same first 3 octets (baseIp taken from rangeStart, iterating only the
-      // last octet) — a /23 or /22 pool spans multiple third octets, so the
-      // map silently rendered the wrong addresses (or none past the first
-      // /24) whenever a range crossed that boundary. Now handles any number
-      // of ranges, each as a proper 32-bit span.
-      const ranges = [{ start: rangeStart, end: rangeEnd }, ...extraRanges]
-        .map(r => ({ startInt: ipToInt(r.start), endInt: ipToInt(r.end) }))
-        .filter(r => !Number.isNaN(r.startInt) && !Number.isNaN(r.endInt) && r.startInt <= r.endInt);
-      if (ranges.length === 0) return [];
-
-      // If every range lives in the same /24-ish block, keep the familiar
-      // short ".123" cell label; otherwise (e.g. a split /23) show the 3rd+4th
-      // octets so cells from different blocks stay distinguishable.
-      const blockOf = (n: number) => Math.floor(n / 256);
-      const firstBlock = blockOf(ranges[0].startInt);
-      const allSameBlock = ranges.every(r => blockOf(r.startInt) === firstBlock && blockOf(r.endInt) === firstBlock);
-
-      // Limit to max 300 cells (combined across all ranges) for display safety
-      const CELL_LIMIT = 300;
       const excludedSet = new Set(config.excludedIps || []);
-      const ipList: { ip: string; label: string; status: 'leased' | 'reserved' | 'self' | 'available'; hostname: string; online?: boolean; excluded: boolean }[] = [];
+      const blockOf = (n: number) => Math.floor(n / 256);
 
-      rangeLoop:
-      for (const { startInt, endInt } of ranges) {
-        for (let cur = startInt; cur <= endInt; cur++) {
-          if (ipList.length >= CELL_LIMIT) break rangeLoop;
-          const currentIp = intToIp(cur);
-
-          // Find if leased or reserved
-          const lease = leases.find(l => l.ip === currentIp);
-          const reservation = reservations.find(r => r.ip === currentIp);
-
-          let status: 'leased' | 'reserved' | 'self' | 'available' = 'available';
-          let hostname = '미할당';
-          let online: boolean | undefined = undefined;
-
-          if (lease) {
-            status = lease.id === 'host-pc-self' ? 'self' : 'leased';
-            hostname = lease.hostname;
-            online = lease.online;
-          } else if (reservation) {
-            status = 'reserved';
-            hostname = `${reservation.hostname} (예약)`;
-          }
-
-          ipList.push({
-            ip: currentIp,
-            label: allSameBlock ? `.${cur % 256}` : `${Math.floor(cur / 256) % 256}.${cur % 256}`,
-            status,
-            hostname,
-            online,
-            // Excluding an IP already in use doesn't evict it — it only
-            // blocks *future* offers (see findAvailableIp on the backend) —
-            // so this is layered as its own flag rather than a status value,
-            // independent of whatever the cell's lease/reservation state is.
-            excluded: excludedSet.has(currentIp)
-          });
-        }
-      }
-
-      // A device can be leased/reserved at an IP outside every configured
-      // range (e.g. an ARP-discovered device with a static address the pool
-      // was never extended to cover) — 할당 단말 현황 shows it regardless
-      // (reads leases/reservations directly, no range filtering), so leaving
-      // it out here made that device look like it had silently vanished from
-      // this map even though it never had a cell to vanish from. Append one
-      // cell per such "orphan" IP so every assigned device always has a cell
-      // somewhere on this map.
-      const coveredIps = new Set(ipList.map(c => c.ip));
-      const orphanIps = new Set<string>();
-      for (const l of leases) if (!coveredIps.has(l.ip)) orphanIps.add(l.ip);
-      for (const r of reservations) if (!coveredIps.has(r.ip)) orphanIps.add(r.ip);
-
-      for (const ip of orphanIps) {
-        if (ipList.length >= CELL_LIMIT) break;
+      const buildCell = (ip: string, ipInt: number): Omit<IpStatusCell, 'label'> => {
         const lease = leases.find(l => l.ip === ip);
         const reservation = reservations.find(r => r.ip === ip);
-
-        let status: 'leased' | 'reserved' | 'self' | 'available' = 'available';
+        let status: IpStatusCell['status'] = 'available';
         let hostname = '미할당';
-        let online: boolean | undefined = undefined;
+        let online: boolean | undefined;
         if (lease) {
           status = lease.id === 'host-pc-self' ? 'self' : 'leased';
           hostname = lease.hostname;
@@ -226,18 +177,75 @@ export default function DhcpServer({
           status = 'reserved';
           hostname = `${reservation.hostname} (예약)`;
         }
+        // Excluding an IP already in use doesn't evict it — it only blocks
+        // *future* offers (see findAvailableIp on the backend) — so this is
+        // layered as its own flag, independent of lease/reservation state.
+        return { ip, ipInt, status, hostname, online, excluded: excludedSet.has(ip) };
+      };
 
-        ipList.push({
-          ip,
-          label: ip, // full IP (not just the last octet) — it may sit far outside the configured pool block
-          status,
-          hostname,
-          online,
-          excluded: excludedSet.has(ip)
-        });
+      const rangeDefs = [
+        { label: '기본 대역', start: rangeStart, end: rangeEnd },
+        ...extraRanges.map((r, i) => ({ label: `추가 대역 #${i + 2}`, start: r.start, end: r.end }))
+      ];
+
+      // Limit to max 300 cells (combined across every section) for display safety
+      const CELL_LIMIT = 300;
+      let total = 0;
+      const groups: { key: string; label: string; startInt: number; cells: Omit<IpStatusCell, 'label'>[] }[] = [];
+
+      rangeLoop:
+      for (let g = 0; g < rangeDefs.length; g++) {
+        const def = rangeDefs[g];
+        const startInt = ipToInt(def.start);
+        const endInt = ipToInt(def.end);
+        if (Number.isNaN(startInt) || Number.isNaN(endInt) || startInt > endInt) continue;
+        const group = { key: `range-${g}`, label: `${def.label} (${def.start}~${def.end})`, startInt, cells: [] as Omit<IpStatusCell, 'label'>[] };
+        groups.push(group);
+        for (let cur = startInt; cur <= endInt; cur++) {
+          if (total >= CELL_LIMIT) break rangeLoop;
+          group.cells.push(buildCell(intToIp(cur), cur));
+          total++;
+        }
       }
+      if (groups.length === 0) return [];
 
-      return ipList;
+      const coveredIps = new Set(groups.flatMap(g => g.cells.map(c => c.ip)));
+      const orphanIps = new Set<string>();
+      for (const l of leases) if (!coveredIps.has(l.ip)) orphanIps.add(l.ip);
+      for (const r of reservations) if (!coveredIps.has(r.ip)) orphanIps.add(r.ip);
+
+      let otherGroup: { key: string; label: string; startInt: number; cells: Omit<IpStatusCell, 'label'>[] } | null = null;
+      for (const ip of orphanIps) {
+        if (total >= CELL_LIMIT) break;
+        const ipInt = ipToInt(ip);
+        if (Number.isNaN(ipInt)) continue;
+        const home = groups.find(gr => blockOf(gr.startInt) === blockOf(ipInt));
+        const cell = buildCell(ip, ipInt);
+        if (home) {
+          home.cells.push(cell);
+        } else {
+          if (!otherGroup) otherGroup = { key: 'other', label: '기타', startInt: ipInt, cells: [] };
+          otherGroup.cells.push(cell);
+        }
+        total++;
+      }
+      if (otherGroup) groups.push(otherGroup);
+
+      return groups
+        .map((g): IpStatusGroup => {
+          const sorted = [...g.cells].sort((a, b) => a.ipInt - b.ipInt);
+          const firstBlock = blockOf(sorted[0]?.ipInt ?? 0);
+          const allSameBlock = sorted.every(c => blockOf(c.ipInt) === firstBlock);
+          return {
+            key: g.key,
+            label: g.label,
+            cells: sorted.map(c => ({
+              ...c,
+              label: allSameBlock ? `.${c.ipInt % 256}` : `${blockOf(c.ipInt) % 256}.${c.ipInt % 256}`
+            }))
+          };
+        })
+        .filter(g => g.cells.length > 0);
     } catch (e) {
       return [];
     }
@@ -967,7 +975,7 @@ export default function DhcpServer({
           </div>
 
           <div>
-            <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">IP 시작 대역</label>
+            <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">시작 대역</label>
             <input 
               type="text" 
               className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
@@ -979,7 +987,7 @@ export default function DhcpServer({
           </div>
 
           <div>
-            <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">IP 종료 대역</label>
+            <label className="block text-slate-400 font-bold mb-1 text-[10px] truncate">종료 대역</label>
             <input 
               type="text" 
               className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
@@ -1107,18 +1115,8 @@ export default function DhcpServer({
             <div className="space-y-3">
               {extraRanges.map((range, idx) => (
                 <div key={range.id} className="p-2.5 bg-slate-950/40 border border-slate-850/60 rounded-xl space-y-1.5">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[9px] text-slate-500 font-mono font-bold">대역 #{idx + 2}</span>
-                    <button
-                      type="button"
-                      onClick={() => handleRemoveExtraRange(range.id)}
-                      className="text-slate-400 hover:text-rose-400 p-1 rounded cursor-pointer transition"
-                      title="이 대역 삭제"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-8 gap-3 items-end text-xs">
+                  <span className="text-[9px] text-slate-500 font-mono font-bold">대역 #{idx + 2}</span>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-9 gap-3 items-end text-xs">
                     <div>
                       <label className="block text-slate-500 font-bold mb-1 text-[10px] truncate" title="어댑터는 위 설정과 항상 동일합니다 — 하나의 어댑터에서만 서비스할 수 있습니다.">바인딩 어댑터</label>
                       <div className="w-full bg-slate-900 border border-slate-850 rounded-lg p-2 text-slate-400 font-sans text-[11px] truncate" title={interfaceName}>
@@ -1187,6 +1185,17 @@ export default function DhcpServer({
                         className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-[11px] focus:outline-none focus:border-indigo-500/80 transition"
                       />
                     </div>
+                    <div>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveExtraRange(range.id)}
+                        className="w-full bg-slate-900 hover:bg-rose-950/40 border border-slate-850 hover:border-rose-900/60 text-slate-400 hover:text-rose-400 rounded-lg p-2 font-bold transition text-[11px] h-[36px] flex items-center justify-center gap-1 cursor-pointer"
+                        title="이 대역 삭제"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        대역 삭제
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
@@ -1244,58 +1253,68 @@ export default function DhcpServer({
             </div>
           </div>
 
-          {/* Grid Map */}
+          {/* Grid Map — one visually separated section per range (기본 대역,
+              each 추가 대역, and 기타 for out-of-range devices), so a gapped
+              pool (e.g. 1~30 / 50~100 / 101~106) reads as distinct blocks
+              instead of running together. */}
           {(() => {
-            const ipStatusMap = getIpStatusMap();
-            return ipStatusMap.length > 0 ? (
-              <div className="grid grid-cols-6 sm:grid-cols-10 md:grid-cols-15 lg:grid-cols-20 gap-1 p-2.5 bg-slate-950/60 border border-slate-850/60 rounded-xl max-h-[140px] overflow-y-auto">
-                {ipStatusMap.map((cell) => {
-                  let bgClass = "bg-slate-800/10 border-slate-700/30 hover:bg-slate-800/40 text-slate-500";
-                  let titleStatus = "여유";
+            const ipStatusGroups = getIpStatusMap();
+            return ipStatusGroups.length > 0 ? (
+              <div className="space-y-3">
+                {ipStatusGroups.map((group) => (
+                  <div key={group.key}>
+                    <div className="text-[10px] font-bold text-slate-400 mb-1.5 font-mono">{group.label}</div>
+                    <div className="grid grid-cols-6 sm:grid-cols-10 md:grid-cols-15 lg:grid-cols-20 gap-1 p-2.5 bg-slate-950/60 border border-slate-850/60 rounded-xl max-h-[140px] overflow-y-auto">
+                      {group.cells.map((cell) => {
+                        let bgClass = "bg-slate-800/10 border-slate-700/30 hover:bg-slate-800/40 text-slate-500";
+                        let titleStatus = "여유";
 
-                  if (cell.status === 'leased') {
-                    bgClass = "bg-emerald-500/20 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30 shadow-[0_0_6px_rgba(16,185,129,0.1)]";
-                    titleStatus = "대여중";
-                  } else if (cell.status === 'reserved') {
-                    bgClass = "bg-indigo-500/20 border-indigo-500/40 text-indigo-400 hover:bg-indigo-500/30 shadow-[0_0_6px_rgba(99,102,241,0.1)]";
-                    titleStatus = "예약중";
-                  } else if (cell.status === 'self') {
-                    bgClass = "bg-sky-500/20 border-sky-500/40 text-sky-400 hover:bg-sky-500/30 shadow-[0_0_6px_rgba(14,165,233,0.1)] font-bold";
-                    titleStatus = "내 PC";
-                  }
+                        if (cell.status === 'leased') {
+                          bgClass = "bg-emerald-500/20 border-emerald-500/40 text-emerald-400 hover:bg-emerald-500/30 shadow-[0_0_6px_rgba(16,185,129,0.1)]";
+                          titleStatus = "대여중";
+                        } else if (cell.status === 'reserved') {
+                          bgClass = "bg-indigo-500/20 border-indigo-500/40 text-indigo-400 hover:bg-indigo-500/30 shadow-[0_0_6px_rgba(99,102,241,0.1)]";
+                          titleStatus = "예약중";
+                        } else if (cell.status === 'self') {
+                          bgClass = "bg-sky-500/20 border-sky-500/40 text-sky-400 hover:bg-sky-500/30 shadow-[0_0_6px_rgba(14,165,233,0.1)] font-bold";
+                          titleStatus = "내 PC";
+                        }
 
-                  const hasLeaseLikeStatus = cell.status !== 'available';
-                  const onlineDotClass = cell.online === undefined
-                    ? "bg-slate-500"
-                    : cell.online ? "bg-emerald-400 animate-pulse" : "bg-rose-500";
-                  const onlineLabel = cell.online === undefined ? "확인 중" : cell.online ? "온라인" : "오프라인";
-                  // Excluding doesn't evict a device already using the IP —
-                  // only blocks it being offered again once free — so this
-                  // layers a dashed ring on top of whatever status color the
-                  // cell already has, rather than replacing it.
-                  if (cell.excluded) bgClass += " border-dashed !border-rose-500/70";
+                        const hasLeaseLikeStatus = cell.status !== 'available';
+                        const onlineDotClass = cell.online === undefined
+                          ? "bg-slate-500"
+                          : cell.online ? "bg-emerald-400 animate-pulse" : "bg-rose-500";
+                        const onlineLabel = cell.online === undefined ? "확인 중" : cell.online ? "온라인" : "오프라인";
+                        // Excluding doesn't evict a device already using the IP —
+                        // only blocks it being offered again once free — so this
+                        // layers a dashed ring on top of whatever status color the
+                        // cell already has, rather than replacing it.
+                        if (cell.excluded) bgClass += " border-dashed !border-rose-500/70";
 
-                  return (
-                    <div
-                      key={cell.ip}
-                      className={`relative p-0.5 rounded border text-center font-mono text-[9px] select-none transition duration-150 ${bgClass}`}
-                      title={`IP: ${cell.ip}\n상태: ${titleStatus}${cell.excluded ? ' (DHCP 할당 제외)' : ''}\n장비명: ${cell.hostname}${hasLeaseLikeStatus ? `\n온라인 상태: ${onlineLabel}` : ''}`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={cell.excluded}
-                        onChange={() => onToggleExcludedIp(cell.ip)}
-                        onClick={(e) => e.stopPropagation()}
-                        title={cell.excluded ? "DHCP 할당 제외 해제" : "DHCP 할당에서 제외"}
-                        className="absolute top-[1px] left-[1px] w-2 h-2 cursor-pointer accent-rose-500"
-                      />
-                      {hasLeaseLikeStatus && (
-                        <span className={`absolute top-[1px] right-[1px] w-1 h-1 rounded-full ${onlineDotClass}`}></span>
-                      )}
-                      <div className="font-bold">{cell.label}</div>
+                        return (
+                          <div
+                            key={cell.ip}
+                            className={`relative p-0.5 rounded border text-center font-mono text-[9px] select-none transition duration-150 ${bgClass}`}
+                            title={`IP: ${cell.ip}\n상태: ${titleStatus}${cell.excluded ? ' (DHCP 할당 제외)' : ''}\n장비명: ${cell.hostname}${hasLeaseLikeStatus ? `\n온라인 상태: ${onlineLabel}` : ''}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={cell.excluded}
+                              onChange={() => onToggleExcludedIp(cell.ip)}
+                              onClick={(e) => e.stopPropagation()}
+                              title={cell.excluded ? "DHCP 할당 제외 해제" : "DHCP 할당에서 제외"}
+                              className="absolute top-[1px] left-[1px] w-2 h-2 cursor-pointer accent-rose-500"
+                            />
+                            {hasLeaseLikeStatus && (
+                              <span className={`absolute top-[1px] right-[1px] w-1 h-1 rounded-full ${onlineDotClass}`}></span>
+                            )}
+                            <div className="font-bold">{cell.label}</div>
+                          </div>
+                        );
+                      })}
                     </div>
-                  );
-                })}
+                  </div>
+                ))}
               </div>
             ) : (
               <div className="text-center text-slate-500 py-4 text-xs bg-slate-950/40 border border-slate-850 rounded-xl">
@@ -1748,7 +1767,7 @@ export default function DhcpServer({
                   className="w-full bg-slate-950 border border-slate-850 rounded-lg p-2 text-white font-mono text-xs focus:outline-none focus:border-indigo-500"
                   placeholder="AA:BB:CC:DD:EE:FF"
                   value={resMac}
-                  onChange={(e) => setResMac(e.target.value)}
+                  onChange={(e) => setResMac(e.target.value.toUpperCase())}
                   required
                 />
               </div>
